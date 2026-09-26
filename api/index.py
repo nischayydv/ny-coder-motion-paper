@@ -16,7 +16,7 @@ app = Flask(__name__)
 
 # ---------- Configuration ----------
 EXTERNAL_API = "https://learning.motion.ac.in/motioneducation/api/getsinglequestion"
-DEFAULT_PAPER_ID = 43643
+DEFAULT_PAPER_ID = 46921
 SUBJECTS = ["Maths", "Physics", "Chemistry"]
 PLANNER_TEST_ID = 0
 USER_ID = "0000"
