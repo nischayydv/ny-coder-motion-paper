@@ -16,6 +16,7 @@ app = Flask(__name__)
 
 # ---------- Configuration ----------
 EXTERNAL_API = "https://learning.motion.ac.in/motioneducation/api/getsinglequestion"
+SOLUTION_API = "https://learning.motion.ac.in/motioneducation/api/getviewsolution"
 DEFAULT_PAPER_ID = 46921
 SUBJECTS = ["Maths", "Physics", "Chemistry"]
 PLANNER_TEST_ID = 0
@@ -87,6 +88,34 @@ def proxy_api():
 
     try:
         resp = requests.get(EXTERNAL_API, params=params, timeout=10)
+        resp.raise_for_status()
+        return jsonify(resp.json())
+    except Exception as e:
+        return jsonify({"status": 500, "error": str(e)}), 500
+
+
+# ---------- Proxy endpoint for a question's solution ----------
+@app.route("/api/solution")
+def solution_api():
+    qid = request.args.get("qid")
+    if not qid:
+        return jsonify({"status": 400, "error": "qid is required"}), 400
+
+    subject = request.args.get("subject", SUBJECTS[0])
+    paper_id = request.args.get("paper_id", DEFAULT_PAPER_ID)
+    planner_test_id = request.args.get("planner_test_id", PLANNER_TEST_ID)
+    user_id = request.args.get("user_id", USER_ID)
+
+    params = {
+        "subject": subject,
+        "paper_id": paper_id,
+        "planner_test_id": planner_test_id,
+        "user_id": user_id,
+        "qid": qid,
+    }
+
+    try:
+        resp = requests.get(SOLUTION_API, params=params, timeout=10)
         resp.raise_for_status()
         return jsonify(resp.json())
     except Exception as e:
@@ -323,6 +352,45 @@ HTML_TEMPLATE = """
         background: rgba(0,20,8,0.55); min-height: 150px; box-shadow: inset 0 0 20px rgba(0,255,65,0.06); }
     .page-info { text-align: center; margin-top: 15px; font-size: 0.95em; color: var(--green-dim); letter-spacing:1px; }
 
+    .sol-btn{
+        margin-top:12px; display:inline-block; padding: 7px 16px; background: transparent;
+        color:#00e5ff; border:1px solid #00e5ff; border-radius:4px; font-weight:600; cursor:pointer;
+        letter-spacing:1px; text-transform:uppercase; font-size:0.78em; font-family:inherit; transition:0.15s;
+    }
+    .sol-btn:hover{ background:#00e5ff; color:#00222a; box-shadow:0 0 14px #00e5ff; }
+    .sol-btn.open{ border-color: var(--amber); color: var(--amber); }
+    .sol-btn.open:hover{ background: var(--amber); color:#231800; box-shadow:0 0 14px var(--amber); }
+
+    .sol-panel{
+        margin-top:14px; padding:16px 18px; border:1px solid var(--border); border-radius:6px;
+        background: rgba(0,255,65,0.03); animation: powerOn 0.4s ease-out;
+    }
+    .sol-panel .sol-loading{ color:#00e5ff; font-size:0.85em; }
+    .sol-panel .sol-loading::before{ content:"root@nycoder:~$ fetching solution... "; color:#79e9ff; }
+    .sol-panel .sol-error{ color: var(--red); font-size:0.85em; }
+
+    .opt-grid{ display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:16px; }
+    @media (max-width: 640px){ .opt-grid{ grid-template-columns: 1fr; } }
+    .opt-box{
+        border:1px solid var(--border); border-radius:6px; padding:10px 14px;
+        background: rgba(0,20,8,0.5); font-size:0.95em; display:flex; gap:10px; align-items:flex-start;
+    }
+    .opt-box .opt-letter{ color:var(--green-dim); font-weight:700; min-width:18px; }
+    .opt-box.correct{
+        border-color: var(--green); background: rgba(0,255,65,0.1);
+        box-shadow: var(--green-glow);
+    }
+    .opt-box.correct .opt-letter{ color:var(--green); }
+    .opt-box.correct::after{ content:"✔ CORRECT"; margin-left:auto; font-size:0.7em; color:var(--green); letter-spacing:1px; }
+
+    .sol-heading{
+        color:var(--amber); text-transform:uppercase; letter-spacing:2px; font-size:0.85em;
+        margin: 4px 0 10px 0; border-bottom:1px dashed var(--border); padding-bottom:6px;
+    }
+    .sol-heading::before{ content:"root@nycoder:~$ cat solution.log"; display:block; color:var(--green-dim); font-size:0.9em; margin-bottom:4px; letter-spacing:0.5px; }
+    .sol-text{ line-height:1.7; color:#d9ffe6; font-size:1em; }
+    .sol-text p{ margin:0.6em 0; }
+
     .footer-tag{
         text-align:center; margin-top:26px; padding-top:16px; border-top:1px solid var(--border);
         color: var(--green-dim); font-size:0.78em; letter-spacing:1.5px;
@@ -387,6 +455,8 @@ HTML_TEMPLATE = """
                 <div class="qid" id="qidDisplay">QID: —</div>
                 <div class="toughness" id="toughnessDisplay">—</div>
                 <div class="q-text" id="qTextDisplay">Enter a Paper ID and click <strong>Execute</strong>.</div>
+                <button class="sol-btn hidden" id="singleSolBtn">&gt; View Solution</button>
+                <div class="sol-panel hidden" id="singleSolPanel"></div>
             </div>
             <div class="nav-buttons">
                 <button id="prevBtn" disabled>◀ Prev Byte</button>
@@ -460,6 +530,8 @@ window.MathJax = {
         const toughnessDisplay = document.getElementById('toughnessDisplay');
         const qTextDisplay = document.getElementById('qTextDisplay');
         const pageInfo = document.getElementById('pageInfo');
+        const singleSolBtn = document.getElementById('singleSolBtn');
+        const singleSolPanel = document.getElementById('singleSolPanel');
 
         const singleView = document.getElementById('singleView');
         const fullView = document.getElementById('fullView');
@@ -545,6 +617,8 @@ window.MathJax = {
                 pageInfo.textContent = 'Page 0 / 0';
                 prevBtn.disabled = true;
                 nextBtn.disabled = true;
+                singleSolBtn.classList.add('hidden');
+                singleSolPanel.classList.add('hidden');
                 return;
             }
 
@@ -560,6 +634,8 @@ window.MathJax = {
                 qidDisplay.textContent = 'QID: —';
                 toughnessDisplay.textContent = '—';
                 qTextDisplay.innerHTML = 'No question on this page.';
+                singleSolBtn.classList.add('hidden');
+                singleSolPanel.classList.add('hidden');
                 return;
             }
 
@@ -568,10 +644,113 @@ window.MathJax = {
             toughnessDisplay.textContent = q.toughness || '—';
             qTextDisplay.innerHTML = q.q_text || '(empty)';
 
+            // Wire up the solution button for this question, resetting any
+            // previously-open panel from the last question viewed.
+            singleSolBtn.dataset.qid = q.qid;
+            singleSolBtn.dataset.subject = q.subject || 'Maths';
+            singleSolBtn.textContent = '> View Solution';
+            singleSolBtn.classList.remove('hidden', 'open');
+            singleSolPanel.classList.add('hidden');
+            singleSolPanel.innerHTML = '';
+
             if (window.MathJax && MathJax.typesetPromise) {
                 MathJax.typesetPromise([qTextDisplay]).catch(err => console.warn('MathJax error:', err));
             }
         }
+
+        // ---------- Solution feature (shared by single + full views) ----------
+        const solutionCache = {}; // qid -> parsed solution record
+
+        function optionLetter(i) {
+            return String.fromCharCode(65 + i); // 0 -> A, 1 -> B, ...
+        }
+
+        function renderSolutionPanel(panelEl, record) {
+            if (!record) {
+                panelEl.innerHTML = '<div class="sol-error">No solution data available.</div>';
+                return;
+            }
+            const opts = record.option || [];
+            let html = '';
+            if (opts.length) {
+                html += '<div class="opt-grid">';
+                opts.forEach((opt, i) => {
+                    const correct = Number(opt.is_correct) === 1;
+                    html += `<div class="opt-box${correct ? ' correct' : ''}">
+                        <span class="opt-letter">${optionLetter(i)}.</span>
+                        <span>${opt.option || ''}</span>
+                    </div>`;
+                });
+                html += '</div>';
+            }
+            html += '<div class="sol-heading">Solution</div>';
+            html += `<div class="sol-text">${record.sol_text || 'No written solution available for this question.'}</div>`;
+            panelEl.innerHTML = html;
+
+            if (window.MathJax && MathJax.typesetPromise) {
+                MathJax.typesetPromise([panelEl]).catch(err => console.warn('MathJax error:', err));
+            }
+        }
+
+        async function fetchSolution(qid, subject, btnEl, panelEl) {
+            const isOpen = !panelEl.classList.contains('hidden');
+            if (isOpen) {
+                panelEl.classList.add('hidden');
+                btnEl.textContent = '> View Solution';
+                btnEl.classList.remove('open');
+                return;
+            }
+
+            panelEl.classList.remove('hidden');
+            btnEl.textContent = '> Hide Solution';
+            btnEl.classList.add('open');
+
+            if (solutionCache[qid]) {
+                renderSolutionPanel(panelEl, solutionCache[qid]);
+                return;
+            }
+
+            panelEl.innerHTML = '<div class="sol-loading">decrypting solution payload</div>';
+
+            try {
+                const params = new URLSearchParams({
+                    subject: subject || 'Maths',
+                    paper_id: paperId,
+                    planner_test_id: 0,
+                    user_id: '0000',
+                    qid: qid
+                });
+                const url = `/api/solution?${params.toString()}`;
+                const response = await fetch(url);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const data = await response.json();
+                if (data.status !== 200) {
+                    throw new Error(data.error || data.message || 'API error');
+                }
+                const record = (data.data && data.data[0]) || null;
+                solutionCache[qid] = record;
+                renderSolutionPanel(panelEl, record);
+            } catch (err) {
+                panelEl.innerHTML = `<div class="sol-error">Error: ${err.message}</div>`;
+            }
+        }
+
+        singleSolBtn.addEventListener('click', function() {
+            const qid = this.dataset.qid;
+            const subject = this.dataset.subject;
+            if (!qid) return;
+            fetchSolution(qid, subject, singleSolBtn, singleSolPanel);
+        });
+
+        // Event delegation for solution buttons rendered inside the full-paper view
+        fullContent.addEventListener('click', function(e) {
+            const btn = e.target.closest('.sol-btn');
+            if (!btn) return;
+            const panel = btn.nextElementSibling;
+            fetchSolution(btn.dataset.qid, btn.dataset.subject, btn, panel);
+        });
 
         async function fetchFullPaper() {
             if (isLoading) return;
@@ -637,6 +816,8 @@ window.MathJax = {
                         html += `<div class="qid">QID: ${q.qid}</div>`;
                         html += `<div class="toughness">${q.toughness || '—'}</div>`;
                         html += `<div class="q-text">${q.q_text || '(empty)'}</div>`;
+                        html += `<button class="sol-btn" data-qid="${q.qid}" data-subject="${sub}">&gt; View Solution</button>`;
+                        html += `<div class="sol-panel hidden"></div>`;
                         html += `</div>`;
                     }
                 }
