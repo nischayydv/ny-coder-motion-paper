@@ -1,8 +1,10 @@
 {
   "builds": [
-    { "src": "api/index.py", "use": "@vercel/python" }
+    { "src": "api/index.py", "use": "@vercel/python" },
+    { "src": "api/pdf.js", "use": "@vercel/node" }
   ],
   "routes": [
+    { "src": "/api/pdf", "dest": "api/pdf.js" },
     { "src": "/(.*)", "dest": "api/index.py" }
   ]
 }
