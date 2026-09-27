@@ -18,6 +18,17 @@
 // path without launching a full browser or rendering anything. Hit this
 // first when debugging a 500 here; it isolates "chromium isn't bundled
 // right" from "something broke during the actual PDF render".
+//
+// Version note: package.json pins @sparticuz/chromium to ^141.0.0 and
+// puppeteer-core to ^24.26.1. Older @sparticuz/chromium releases only
+// detected a "real" AWS Lambda environment (via AWS-specific env vars)
+// to decide whether to extract their bundled AL2023 shared-library set
+// (which includes libnss3.so). Vercel's Fluid Compute runtime is
+// Lambda-compatible but doesn't set those AWS env vars, so older
+// versions silently skipped extraction here and Chromium failed to
+// launch with "libnss3.so: cannot open shared object file". 141.x+
+// detects Vercel natively via the VERCEL env var Vercel always sets.
+// Don't downgrade below ~131 without re-checking this.
 
 let chromium, puppeteer, loadError;
 try {
@@ -78,7 +89,6 @@ module.exports = async (req, res) => {
     browser = await puppeteer.launch({
       args: chromium.args,
       executablePath,
-      headless: chromium.headless,
     });
 
     const page = await browser.newPage();
