@@ -1146,7 +1146,7 @@ window.MathJax = {
                 </style>
               </head><body>
                 ${printContainer.outerHTML}
-                <script>window.__mathjaxDone = true;</script>
+                <script>window.__mathjaxDone = true;<${''}/script>
               </body></html>`;
 
             pdfStatus.textContent = 'Generating PDF on server...';
