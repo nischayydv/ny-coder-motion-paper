@@ -17,10 +17,10 @@ app = Flask(__name__)
 # ---------- Configuration ----------
 EXTERNAL_API = "https://learning.motion.ac.in/motioneducation/api/getsinglequestion"
 SOLUTION_API = "https://learning.motion.ac.in/motioneducation/api/getviewsolution"
-DEFAULT_PAPER_ID = 46921
+DEFAULT_PAPER_ID = 43643
 SUBJECTS = ["Maths", "Physics", "Chemistry"]
 PLANNER_TEST_ID = 0
-USER_ID = "833031"
+USER_ID = "0000"
 
 # Sent on every upstream call so requests look like they come from a real
 # browser session on the site itself, rather than a bare python-requests
@@ -370,6 +370,10 @@ HTML_TEMPLATE = """
     .controls button.secondary { border-color: var(--amber); color: var(--amber); }
     .controls button.secondary:hover { background: var(--amber); color:#231800; box-shadow:0 0 14px var(--amber); }
 
+    .controls button.pdf-btn { border-color: var(--red); color: var(--red); }
+    .controls button.pdf-btn:hover { background: var(--red); color:#2a0008; box-shadow:0 0 14px var(--red); }
+    .controls button.pdf-btn:disabled { border-color:#4a1a24; color:#7a3a44; cursor:not-allowed; background:transparent; box-shadow:none; }
+
     .mode-toggle { margin-left: auto; display: flex; gap: 14px; align-items: center; }
     .mode-toggle label { font-weight: 400; cursor: pointer; color:var(--green); text-transform:none; letter-spacing:0; }
     .mode-toggle input[type="radio"] { margin-right: 4px; accent-color: var(--green); }
@@ -456,6 +460,75 @@ HTML_TEMPLATE = """
     ::-webkit-scrollbar-track{ background:#020402; }
     ::-webkit-scrollbar-thumb{ background: var(--border); border-radius:5px; }
     ::-webkit-scrollbar-thumb:hover{ background: var(--green-dim); }
+
+    /* ---------- Print-only exam-paper layout (Download PDF feature) ---------- */
+    .print-only{ display:none; }
+
+    @media print {
+        @page { margin: 18mm 16mm; }
+
+        html, body{ height:auto; }
+        body *{ visibility:hidden; }
+        #matrixCanvas, .scanlines, .crt-flicker{ display:none !important; }
+
+        #printContainer, #printContainer *{ visibility:visible; }
+        #printContainer{
+            display:block; position:absolute; inset:0; margin:0; padding:0;
+            background:#ffffff; color:#1a1a1a;
+            font-family: Georgia, 'Times New Roman', serif;
+        }
+
+        .pdf-header{
+            display:flex; justify-content:space-between; align-items:flex-end;
+            border-bottom:3px solid #1a1a1a; padding-bottom:10px; margin-bottom:18px;
+        }
+        .pdf-header .pdf-brand{ font-size:1.5em; font-weight:700; letter-spacing:2px; font-family: 'Courier New', monospace; }
+        .pdf-header .pdf-brand span{ color:#c0392b; }
+        .pdf-header .pdf-meta{ text-align:right; font-size:0.85em; color:#444; font-family: Arial, sans-serif; line-height:1.5; }
+
+        .pdf-subject-title{
+            font-family: Arial, sans-serif; font-size:1.15em; font-weight:700; text-transform:uppercase;
+            letter-spacing:1px; background:#f0f0f0; padding:6px 12px; margin:22px 0 12px 0;
+            border-left:4px solid #1a1a1a;
+        }
+
+        .pdf-question{ margin-bottom:18px; page-break-inside: avoid; }
+        .pdf-question .pdf-qnum{ font-weight:700; font-size:1.02em; }
+        .pdf-question .pdf-qtag{
+            font-family: Arial, sans-serif; font-size:0.7em; color:#666; border:1px solid #999;
+            border-radius:10px; padding:1px 8px; margin-left:8px; text-transform:uppercase;
+        }
+        .pdf-question .pdf-qtext{ margin:6px 0 10px 0; line-height:1.5; }
+        .pdf-question .pdf-qtext p{ margin:0.4em 0; }
+
+        .pdf-opts{ display:grid; grid-template-columns: 1fr 1fr; gap:6px 18px; margin-left:6px; }
+        .pdf-opt{ font-family: Arial, sans-serif; font-size:0.95em; display:flex; gap:6px; }
+        .pdf-opt .pdf-opt-letter{ font-weight:700; min-width:16px; }
+        .pdf-opt.pdf-correct{ font-weight:700; }
+        .pdf-opt.pdf-correct .pdf-opt-letter::after{ content:" \2713"; }
+        .pdf-opt-unavailable{ font-family: Arial, sans-serif; font-size:0.8em; color:#888; font-style:italic; margin-left:6px; }
+
+        .pdf-answer-key{ margin-top:30px; page-break-before: always; }
+        .pdf-answer-key h2{
+            font-family: Arial, sans-serif; font-size:1.2em; text-transform:uppercase; letter-spacing:1px;
+            border-bottom:2px solid #1a1a1a; padding-bottom:6px; margin-bottom:14px;
+        }
+        .pdf-key-grid{
+            display:grid; grid-template-columns: repeat(6, 1fr); gap:8px 4px;
+            font-family: Arial, sans-serif; font-size:0.9em;
+        }
+        .pdf-key-cell{ border:1px solid #ccc; border-radius:4px; padding:4px 6px; text-align:center; }
+        .pdf-key-cell b{ color:#c0392b; }
+        .pdf-key-subject-label{
+            grid-column: 1 / -1; font-weight:700; font-size:0.85em; text-transform:uppercase;
+            color:#444; margin-top:8px;
+        }
+
+        .pdf-footer{
+            margin-top:20px; padding-top:8px; border-top:1px solid #ccc;
+            font-family: Arial, sans-serif; font-size:0.7em; color:#999; text-align:center;
+        }
+    }
 </style>
 </head>
 <body>
@@ -493,6 +566,7 @@ HTML_TEMPLATE = """
             <input type="text" id="userId" value="{{ default_user_id }}" placeholder="0000">
             <button id="goBtn">&gt; Execute</button>
             <button id="resetBtn" class="secondary">&gt; Reset</button>
+            <button id="pdfBtn" class="pdf-btn">&gt; Download PDF</button>
 
             <div class="mode-toggle">
                 <span style="margin-right: 6px; color:var(--green-dim); text-transform:uppercase; font-size:0.85em; letter-spacing:1px;">Mode:</span>
@@ -505,6 +579,7 @@ HTML_TEMPLATE = """
         </div>
 
         <div id="status" class="status"></div>
+        <div id="pdfStatus" class="status hidden"></div>
 
         <!-- Single-question view -->
         <div id="singleView">
@@ -534,6 +609,11 @@ HTML_TEMPLATE = """
     </div>
   </div>
 </div>
+
+<!-- Print-only, professionally formatted PDF/exam-paper layout.
+     Hidden on screen; @media print swaps visibility so this is the only
+     thing that ends up in the generated PDF when the user hits Download PDF. -->
+<div id="printContainer" class="print-only"></div>
 
 <script>
 window.MathJax = {
@@ -590,6 +670,9 @@ window.MathJax = {
         const pageInfo = document.getElementById('pageInfo');
         const singleSolBtn = document.getElementById('singleSolBtn');
         const singleSolPanel = document.getElementById('singleSolPanel');
+        const pdfBtn = document.getElementById('pdfBtn');
+        const pdfStatus = document.getElementById('pdfStatus');
+        const printContainer = document.getElementById('printContainer');
 
         const singleView = document.getElementById('singleView');
         const fullView = document.getElementById('fullView');
@@ -602,6 +685,8 @@ window.MathJax = {
         let paperId = parseInt(paperInput.value) || {{ default_paper }};
         let isLoading = false;
         let currentMode = 'single';
+        let currentSingleQuestion = null; // { qid, subject, toughness, q_text } for the on-screen single question
+        let lastFullPaperData = null;      // last successful /api/full_paper response, for PDF export
 
         function switchMode(mode) {
             currentMode = mode;
@@ -697,6 +782,7 @@ window.MathJax = {
                 nextBtn.disabled = true;
                 singleSolBtn.classList.add('hidden');
                 singleSolPanel.classList.add('hidden');
+                currentSingleQuestion = null;
                 return;
             }
 
@@ -714,6 +800,7 @@ window.MathJax = {
                 qTextDisplay.innerHTML = 'No question on this page.';
                 singleSolBtn.classList.add('hidden');
                 singleSolPanel.classList.add('hidden');
+                currentSingleQuestion = null;
                 return;
             }
 
@@ -721,6 +808,12 @@ window.MathJax = {
             qidDisplay.textContent = `QID: ${q.qid}`;
             toughnessDisplay.textContent = q.toughness || '—';
             qTextDisplay.innerHTML = q.q_text || '(empty)';
+            currentSingleQuestion = {
+                qid: q.qid,
+                subject: q.subject || 'Maths',
+                toughness: q.toughness || '—',
+                q_text: q.q_text || '(empty)'
+            };
 
             // Wire up the solution button for this question, resetting any
             // previously-open panel from the last question viewed.
@@ -736,16 +829,47 @@ window.MathJax = {
             }
         }
 
-        // ---------- Solution feature (shared by single + full views) ----------
-        const solutionCache = {}; // qid -> parsed solution record
+        // ---------- Solution feature (shared by single view, full view, and PDF export) ----------
+        const solutionCache = {}; // qid -> parsed solution record | { __error: message }
 
         function optionLetter(i) {
             return String.fromCharCode(65 + i); // 0 -> A, 1 -> B, ...
         }
 
+        // Fetches (and caches) the options + correct-answer + solution record
+        // for one question. Shared by the "View Solution" panel and the PDF
+        // export, so a question the user already expanded on screen won't be
+        // re-fetched when building the PDF, and vice versa.
+        async function fetchSolutionRecord(qid, subject) {
+            if (Object.prototype.hasOwnProperty.call(solutionCache, qid)) {
+                return solutionCache[qid];
+            }
+            try {
+                const params = new URLSearchParams({
+                    subject: subject || 'Maths',
+                    paper_id: paperId,
+                    planner_test_id: 0,
+                    user_id: currentUserId(),
+                    qid: qid
+                });
+                const data = await fetchJSON(`/api/solution?${params.toString()}`);
+                const record = (data.data && data.data[0]) || null;
+                solutionCache[qid] = record;
+                return record;
+            } catch (err) {
+                const errored = { __error: err.message };
+                solutionCache[qid] = errored;
+                return errored;
+            }
+        }
+
         function renderSolutionPanel(panelEl, record) {
             if (!record) {
                 panelEl.innerHTML = '<div class="sol-error">No solution data available.</div>';
+                return;
+            }
+            if (record.__error) {
+                panelEl.innerHTML = `<div class="sol-error">Error: ${record.__error}</div>`;
                 return;
             }
             const opts = record.option || [];
@@ -783,28 +907,15 @@ window.MathJax = {
             btnEl.textContent = '> Hide Solution';
             btnEl.classList.add('open');
 
-            if (solutionCache[qid]) {
-                renderSolutionPanel(panelEl, solutionCache[qid]);
+            const cached = Object.prototype.hasOwnProperty.call(solutionCache, qid) ? solutionCache[qid] : undefined;
+            if (cached !== undefined) {
+                renderSolutionPanel(panelEl, cached);
                 return;
             }
 
             panelEl.innerHTML = '<div class="sol-loading">decrypting solution payload</div>';
-
-            try {
-                const params = new URLSearchParams({
-                    subject: subject || 'Maths',
-                    paper_id: paperId,
-                    planner_test_id: 0,
-                    user_id: currentUserId(),
-                    qid: qid
-                });
-                const data = await fetchJSON(`/api/solution?${params.toString()}`);
-                const record = (data.data && data.data[0]) || null;
-                solutionCache[qid] = record;
-                renderSolutionPanel(panelEl, record);
-            } catch (err) {
-                panelEl.innerHTML = `<div class="sol-error">Error: ${err.message}</div>`;
-            }
+            const record = await fetchSolutionRecord(qid, subject);
+            renderSolutionPanel(panelEl, record);
         }
 
         singleSolBtn.addEventListener('click', function() {
@@ -822,6 +933,177 @@ window.MathJax = {
             fetchSolution(btn.dataset.qid, btn.dataset.subject, btn, panel);
         });
 
+        // ---------- PDF export ("Download PDF") ----------
+        // Runs a list of async jobs with a concurrency cap so we don't fire
+        // 40+ simultaneous requests at the upstream API when exporting a
+        // full paper.
+        async function mapWithConcurrency(items, limit, worker) {
+            const results = new Array(items.length);
+            let nextIndex = 0;
+            async function runNext() {
+                while (nextIndex < items.length) {
+                    const i = nextIndex++;
+                    results[i] = await worker(items[i], i);
+                }
+            }
+            const workers = Array.from({ length: Math.min(limit, items.length) }, runNext);
+            await Promise.all(workers);
+            return results;
+        }
+
+        function correctLetterFor(record) {
+            if (!record || record.__error || !Array.isArray(record.option)) return null;
+            const idx = record.option.findIndex(o => Number(o.is_correct) === 1);
+            return idx >= 0 ? optionLetter(idx) : null;
+        }
+
+        function buildPrintHtml(numbered, meta) {
+            let html = '';
+
+            html += `<div class="pdf-header">
+                <div class="pdf-brand">NY <span>CODER</span></div>
+                <div class="pdf-meta">
+                    Paper ID: ${meta.paperId}<br>
+                    User: ${meta.userId}<br>
+                    Generated: ${meta.date}
+                </div>
+            </div>`;
+
+            let lastSubject = null;
+            numbered.forEach(item => {
+                if (item.subject !== lastSubject) {
+                    html += `<div class="pdf-subject-title">${item.subject}</div>`;
+                    lastSubject = item.subject;
+                }
+
+                const record = item.record;
+                html += `<div class="pdf-question">`;
+                html += `<div><span class="pdf-qnum">Q${item.num}.</span><span class="pdf-qtag">${item.q.toughness || '—'}</span></div>`;
+                html += `<div class="pdf-qtext">${item.q.q_text || '(empty)'}</div>`;
+
+                if (record && !record.__error && Array.isArray(record.option) && record.option.length) {
+                    html += '<div class="pdf-opts">';
+                    record.option.forEach((opt, i) => {
+                        const correct = Number(opt.is_correct) === 1;
+                        html += `<div class="pdf-opt${correct ? ' pdf-correct' : ''}">
+                            <span class="pdf-opt-letter">${optionLetter(i)}.</span>
+                            <span>${opt.option || ''}</span>
+                        </div>`;
+                    });
+                    html += '</div>';
+                } else if (record && record.__error) {
+                    html += `<div class="pdf-opt-unavailable">Options/answer unavailable for QID ${item.q.qid}: ${record.__error}</div>`;
+                } else {
+                    html += `<div class="pdf-opt-unavailable">No options data available for QID ${item.q.qid}.</div>`;
+                }
+
+                html += `</div>`;
+            });
+
+            // Answer key, grouped by subject, at the end.
+            html += `<div class="pdf-answer-key"><h2>Answer Key</h2><div class="pdf-key-grid">`;
+            lastSubject = null;
+            numbered.forEach(item => {
+                if (item.subject !== lastSubject) {
+                    html += `<div class="pdf-key-subject-label">${item.subject}</div>`;
+                    lastSubject = item.subject;
+                }
+                const letter = correctLetterFor(item.record);
+                html += `<div class="pdf-key-cell">Q${item.num}: <b>${letter || '—'}</b></div>`;
+            });
+            html += `</div></div>`;
+
+            html += `<div class="pdf-footer">NY CODER :: Question Extraction Terminal — Paper ${meta.paperId} — generated ${meta.date}</div>`;
+
+            return html;
+        }
+
+        async function handleDownloadPdf() {
+            if (pdfBtn.disabled) return;
+
+            // Build a subject-grouped, sequentially-numbered question list
+            // from whichever view is currently active.
+            let groups = [];
+            if (currentMode === 'single') {
+                if (!currentSingleQuestion) {
+                    pdfStatus.classList.remove('hidden');
+                    pdfStatus.className = 'status error';
+                    pdfStatus.textContent = 'No question loaded to export yet.';
+                    return;
+                }
+                groups = [{ subject: currentSingleQuestion.subject, questions: [currentSingleQuestion] }];
+            } else {
+                if (!lastFullPaperData) {
+                    pdfStatus.classList.remove('hidden');
+                    pdfStatus.className = 'status error';
+                    pdfStatus.textContent = 'No full paper loaded to export yet.';
+                    return;
+                }
+                const subjects = lastFullPaperData.subjects || {};
+                groups = ['Maths', 'Physics', 'Chemistry']
+                    .map(sub => ({ subject: sub, questions: (subjects[sub] && subjects[sub].questions) || [] }))
+                    .filter(g => g.questions.length > 0);
+            }
+
+            const numbered = [];
+            let n = 0;
+            groups.forEach(g => g.questions.forEach(q => { n++; numbered.push({ num: n, subject: g.subject, q }); }));
+
+            if (numbered.length === 0) {
+                pdfStatus.classList.remove('hidden');
+                pdfStatus.className = 'status error';
+                pdfStatus.textContent = 'Nothing to export.';
+                return;
+            }
+
+            const originalBtnText = pdfBtn.textContent;
+            const originalTitle = document.title;
+            pdfBtn.disabled = true;
+            pdfBtn.textContent = '> Preparing...';
+            pdfStatus.classList.remove('hidden');
+            pdfStatus.className = 'status loading';
+            pdfStatus.textContent = `Compiling ${numbered.length} question(s) into PDF...`;
+
+            let done = 0;
+            await mapWithConcurrency(numbered, 4, async (item) => {
+                item.record = await fetchSolutionRecord(item.q.qid, item.subject);
+                done++;
+                pdfStatus.textContent = `Compiling ${done}/${numbered.length} question(s) into PDF...`;
+            });
+
+            printContainer.innerHTML = buildPrintHtml(numbered, {
+                paperId: paperId,
+                userId: currentUserId(),
+                date: new Date().toLocaleString()
+            });
+
+            pdfStatus.textContent = 'Rendering equations...';
+
+            const finish = () => {
+                document.title = originalTitle;
+                pdfBtn.disabled = false;
+                pdfBtn.textContent = originalBtnText;
+                pdfStatus.classList.add('hidden');
+            };
+
+            document.title = `NY_CODER_Paper_${paperId}`;
+
+            if (window.MathJax && MathJax.typesetPromise) {
+                try {
+                    await MathJax.typesetPromise([printContainer]);
+                } catch (e) {
+                    console.warn('MathJax typeset error (PDF):', e);
+                }
+            }
+
+            window.print();
+            window.addEventListener('afterprint', finish, { once: true });
+            // Fallback in case 'afterprint' never fires (some mobile browsers).
+            setTimeout(finish, 5000);
+        }
+
+        pdfBtn.addEventListener('click', handleDownloadPdf);
+
         async function fetchFullPaper() {
             if (isLoading) return;
             isLoading = true;
@@ -838,12 +1120,14 @@ window.MathJax = {
                 statusDiv.textContent = `Error: ${err.message}`;
                 statusDiv.className = 'status error';
                 fullContent.innerHTML = '<p style="color:#ff2d55;">Failed to load full paper.</p>';
+                lastFullPaperData = null;
             } finally {
                 isLoading = false;
             }
         }
 
         function renderFull(data) {
+            lastFullPaperData = data;
             const subjects = data.subjects || {};
             let html = '';
 
