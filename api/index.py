@@ -17,14 +17,71 @@ app = Flask(__name__)
 # ---------- Configuration ----------
 EXTERNAL_API = "https://learning.motion.ac.in/motioneducation/api/getsinglequestion"
 SOLUTION_API = "https://learning.motion.ac.in/motioneducation/api/getviewsolution"
-DEFAULT_PAPER_ID = 46921
+DEFAULT_PAPER_ID = 43643
 SUBJECTS = ["Maths", "Physics", "Chemistry"]
 PLANNER_TEST_ID = 0
-USER_ID = "833031"
+USER_ID = "0000"
+
+# Sent on every upstream call so requests look like they come from a real
+# browser session on the site itself, rather than a bare python-requests
+# client — some endpoints on this API (notably getviewsolution) are pickier
+# about this than the plain question-listing endpoint.
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://learning.motion.ac.in/",
+    "Origin": "https://learning.motion.ac.in",
+}
+
+
+def upstream_get(url, params):
+    """
+    GET an upstream endpoint and return (ok, payload, http_status).
+
+    Unlike a bare requests.get + raise_for_status(), this:
+    - always tries to read a body, even on non-2xx, since this API sometimes
+      puts a real error message in a JSON body alongside a non-200 status
+    - reports upstream network failures, non-JSON bodies (e.g. a WAF/CDN
+      HTML challenge page), and non-2xx statuses with distinct, readable
+      messages instead of collapsing everything into an opaque "HTTP 500"
+    """
+    try:
+        resp = requests.get(url, params=params, headers=REQUEST_HEADERS, timeout=15)
+    except requests.exceptions.RequestException as e:
+        return False, {"status": 502, "error": f"Network error reaching upstream: {e}"}, 502
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        snippet = resp.text[:300].replace("\n", " ").strip()
+        # A non-JSON body is always a failure from our point of view, even if
+        # the upstream returned HTTP 200 (some WAF/CDN challenge pages do).
+        # Use the upstream status if it already signals an error; otherwise
+        # report it as a Bad Gateway so the caller doesn't mistake this for
+        # a real 200 success.
+        reported_status = resp.status_code if resp.status_code >= 400 else 502
+        return False, {
+            "status": reported_status,
+            "error": f"Upstream returned a non-JSON response (HTTP {resp.status_code}): {snippet or '(empty body)'}",
+        }, reported_status
+
+    if resp.status_code >= 400:
+        upstream_msg = None
+        if isinstance(payload, dict):
+            upstream_msg = payload.get("message") or payload.get("error")
+        return False, {
+            "status": resp.status_code,
+            "error": upstream_msg or f"Upstream HTTP {resp.status_code}",
+        }, resp.status_code
+
+    return True, payload, resp.status_code
 
 
 # ---------- Helper: fetch all pages for one subject ----------
-def fetch_all_pages_for_subject(paper_id, subject):
+def fetch_all_pages_for_subject(paper_id, subject, user_id):
     all_questions = []
     page = 1
     total_pages = None
@@ -34,19 +91,16 @@ def fetch_all_pages_for_subject(paper_id, subject):
             "subject": subject,
             "paper_id": paper_id,
             "planner_test_id": PLANNER_TEST_ID,
-            "user_id": USER_ID,
+            "user_id": user_id,
             "page": page,
         }
-        try:
-            resp = requests.get(EXTERNAL_API, params=params, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
+        ok, data, _status = upstream_get(EXTERNAL_API, params)
+        if not ok:
             return {
                 "subject": subject,
                 "questions": [],
                 "count": 0,
-                "error": str(e),
+                "error": data.get("error", "Unknown upstream error"),
             }
 
         questions_data = data.get("questions", {})
@@ -86,12 +140,10 @@ def proxy_api():
         "page": page,
     }
 
-    try:
-        resp = requests.get(EXTERNAL_API, params=params, timeout=10)
-        resp.raise_for_status()
-        return jsonify(resp.json())
-    except Exception as e:
-        return jsonify({"status": 500, "error": str(e)}), 500
+    ok, payload, status = upstream_get(EXTERNAL_API, params)
+    if not ok:
+        return jsonify(payload), status
+    return jsonify(payload)
 
 
 # ---------- Proxy endpoint for a question's solution ----------
@@ -114,23 +166,22 @@ def solution_api():
         "qid": qid,
     }
 
-    try:
-        resp = requests.get(SOLUTION_API, params=params, timeout=10)
-        resp.raise_for_status()
-        return jsonify(resp.json())
-    except Exception as e:
-        return jsonify({"status": 500, "error": str(e)}), 500
+    ok, payload, status = upstream_get(SOLUTION_API, params)
+    if not ok:
+        return jsonify(payload), status
+    return jsonify(payload)
 
 
 # ---------- Full paper (all subjects, all pages) ----------
 @app.route("/api/full_paper")
 def full_paper_api():
     paper_id = request.args.get("paper_id", DEFAULT_PAPER_ID)
+    user_id = request.args.get("user_id", USER_ID)
 
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         future_to_subject = {
-            executor.submit(fetch_all_pages_for_subject, paper_id, subject): subject
+            executor.submit(fetch_all_pages_for_subject, paper_id, subject, user_id): subject
             for subject in SUBJECTS
         }
         for future in concurrent.futures.as_completed(future_to_subject):
@@ -152,6 +203,7 @@ def full_paper_api():
             "subjects": results,
         }
     )
+
 
 
 # ---------- HTML page (embedded, NY CODER theme) ----------
@@ -301,12 +353,12 @@ HTML_TEMPLATE = """
     .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 20px;
         border-top:1px solid var(--border); border-bottom:1px solid var(--border); padding:14px 0; }
     .controls label { font-weight: 600; color:var(--green-dim); font-size:0.85em; text-transform:uppercase; letter-spacing:1px;}
-    .controls input[type="number"] {
+    .controls input[type="number"], .controls input[type="text"] {
         padding: 9px 12px; width: 150px; background:#02120a; color:var(--green);
         border: 1px solid var(--border); border-radius: 4px; font-size: 1em; font-family:inherit;
         box-shadow: inset 0 0 8px rgba(0,255,65,0.15);
     }
-    .controls input[type="number"]:focus{ outline:none; border-color:var(--green); box-shadow: var(--green-glow); }
+    .controls input[type="number"]:focus, .controls input[type="text"]:focus{ outline:none; border-color:var(--green); box-shadow: var(--green-glow); }
 
     .controls button {
         padding: 9px 20px; background: transparent; color: var(--green); border: 1px solid var(--green);
@@ -437,6 +489,8 @@ HTML_TEMPLATE = """
         <div class="controls">
             <label for="paperId">Target Paper_ID ::</label>
             <input type="number" id="paperId" value="{{ default_paper }}" min="1">
+            <label for="userId">User_ID ::</label>
+            <input type="text" id="userId" value="{{ default_user_id }}" placeholder="0000">
             <button id="goBtn">&gt; Execute</button>
             <button id="resetBtn" class="secondary">&gt; Reset</button>
 
@@ -445,6 +499,9 @@ HTML_TEMPLATE = """
                 <label><input type="radio" name="mode" value="single" checked> Single</label>
                 <label><input type="radio" name="mode" value="full"> Full Dump</label>
             </div>
+        </div>
+        <div class="subtitle" style="text-align:left; margin: -12px 0 16px 0;">
+            Tip: solutions/attempt-status are looked up per user on the upstream API — if <b>View Solution</b> errors out, try setting User_ID to your real account id instead of the default placeholder.
         </div>
 
         <div id="status" class="status"></div>
@@ -521,6 +578,7 @@ window.MathJax = {
 <script>
     (function() {
         const paperInput = document.getElementById('paperId');
+        const userIdInput = document.getElementById('userId');
         const goBtn = document.getElementById('goBtn');
         const resetBtn = document.getElementById('resetBtn');
         const prevBtn = document.getElementById('prevBtn');
@@ -568,6 +626,34 @@ window.MathJax = {
             });
         });
 
+        function currentUserId() {
+            return (userIdInput.value || '').trim() || '0000';
+        }
+
+        // Fetches a URL and always returns the parsed JSON body — even on a
+        // non-2xx response — so upstream error text (surfaced by our own
+        // /api* routes) makes it to the UI instead of a bare "HTTP 500".
+        async function fetchJSON(url) {
+            let response;
+            try {
+                response = await fetch(url);
+            } catch (networkErr) {
+                throw new Error(`Network error: ${networkErr.message}`);
+            }
+
+            let data = null;
+            try {
+                data = await response.json();
+            } catch (parseErr) {
+                throw new Error(`Bad response (HTTP ${response.status}): could not parse JSON`);
+            }
+
+            if (!response.ok || data.status !== 200) {
+                throw new Error(data.error || data.message || `HTTP ${response.status}`);
+            }
+            return data;
+        }
+
         async function fetchQuestion(page) {
             if (isLoading) return;
             isLoading = true;
@@ -580,17 +666,9 @@ window.MathJax = {
                     page: page,
                     subject: 'Maths',
                     planner_test_id: 0,
-                    user_id: '0000'
+                    user_id: currentUserId()
                 });
-                const url = `/api?${params.toString()}`;
-                const response = await fetch(url);
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
-                }
-                const data = await response.json();
-                if (data.status !== 200) {
-                    throw new Error(data.error || 'API error');
-                }
+                const data = await fetchJSON(`/api?${params.toString()}`);
                 renderSingle(data);
                 statusDiv.textContent = 'Loaded';
                 statusDiv.className = 'status';
@@ -717,18 +795,10 @@ window.MathJax = {
                     subject: subject || 'Maths',
                     paper_id: paperId,
                     planner_test_id: 0,
-                    user_id: '0000',
+                    user_id: currentUserId(),
                     qid: qid
                 });
-                const url = `/api/solution?${params.toString()}`;
-                const response = await fetch(url);
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
-                }
-                const data = await response.json();
-                if (data.status !== 200) {
-                    throw new Error(data.error || data.message || 'API error');
-                }
+                const data = await fetchJSON(`/api/solution?${params.toString()}`);
                 const record = (data.data && data.data[0]) || null;
                 solutionCache[qid] = record;
                 renderSolutionPanel(panelEl, record);
@@ -759,16 +829,8 @@ window.MathJax = {
             statusDiv.className = 'status loading';
 
             try {
-                const params = new URLSearchParams({ paper_id: paperId });
-                const url = `/api/full_paper?${params.toString()}`;
-                const response = await fetch(url);
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
-                }
-                const data = await response.json();
-                if (data.status !== 200) {
-                    throw new Error(data.error || 'API error');
-                }
+                const params = new URLSearchParams({ paper_id: paperId, user_id: currentUserId() });
+                const data = await fetchJSON(`/api/full_paper?${params.toString()}`);
                 renderFull(data);
                 statusDiv.textContent = 'Full paper loaded';
                 statusDiv.className = 'status';
@@ -809,7 +871,11 @@ window.MathJax = {
                 </div>`;
 
                 if (count === 0) {
-                    html += `<p style="color:#3a5c3e;padding:10px 0;">No questions found for this subject.</p>`;
+                    if (info.error) {
+                        html += `<p class="sol-error" style="padding:10px 0;">Error loading ${sub}: ${info.error}</p>`;
+                    } else {
+                        html += `<p style="color:#3a5c3e;padding:10px 0;">No questions found for this subject.</p>`;
+                    }
                 } else {
                     for (const q of questions) {
                         html += `<div class="question-item">`;
@@ -881,7 +947,7 @@ window.MathJax = {
 @app.route("/")
 def index():
     """Serve the main HTML page."""
-    return render_template_string(HTML_TEMPLATE, default_paper=DEFAULT_PAPER_ID)
+    return render_template_string(HTML_TEMPLATE, default_paper=DEFAULT_PAPER_ID, default_user_id=USER_ID)
 
 
 # Note: no app.run() here — Vercel's @vercel/python runtime imports this
