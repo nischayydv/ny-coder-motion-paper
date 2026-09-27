@@ -17,10 +17,10 @@ app = Flask(__name__)
 # ---------- Configuration ----------
 EXTERNAL_API = "https://learning.motion.ac.in/motioneducation/api/getsinglequestion"
 SOLUTION_API = "https://learning.motion.ac.in/motioneducation/api/getviewsolution"
-DEFAULT_PAPER_ID = 46921
+DEFAULT_PAPER_ID = 43643
 SUBJECTS = ["Maths", "Physics", "Chemistry"]
 PLANNER_TEST_ID = 0
-USER_ID = "833031"
+USER_ID = "0000"
 
 # Sent on every upstream call so requests look like they come from a real
 # browser session on the site itself, rather than a bare python-requests
@@ -505,7 +505,7 @@ HTML_TEMPLATE = """
         .pdf-opt{ font-family: Arial, sans-serif; font-size:0.95em; display:flex; gap:6px; }
         .pdf-opt .pdf-opt-letter{ font-weight:700; min-width:16px; }
         .pdf-opt.pdf-correct{ font-weight:700; }
-        .pdf-opt.pdf-correct .pdf-opt-letter::after{ content:" \2713"; }
+        .pdf-opt.pdf-correct .pdf-opt-letter::after{ content:" \\2713"; }
         .pdf-opt-unavailable{ font-family: Arial, sans-serif; font-size:0.8em; color:#888; font-style:italic; margin-left:6px; }
 
         .pdf-answer-key{ margin-top:30px; page-break-before: always; }
@@ -1081,7 +1081,6 @@ window.MathJax = {
             }
 
             const originalBtnText = pdfBtn.textContent;
-            const originalTitle = document.title;
             pdfBtn.disabled = true;
             pdfBtn.textContent = '> Preparing...';
             pdfStatus.classList.remove('hidden');
@@ -1104,13 +1103,18 @@ window.MathJax = {
             pdfStatus.textContent = 'Rendering equations...';
 
             const finish = () => {
-                document.title = originalTitle;
                 pdfBtn.disabled = false;
                 pdfBtn.textContent = originalBtnText;
                 pdfStatus.classList.add('hidden');
+                printContainer.style.cssText = ''; // back to display:none via .print-only
             };
 
-            document.title = `NY_CODER_Paper_${paperId}`;
+            // printContainer is normally display:none (shown only via
+            // @media print). We need it laid out — even if off-screen —
+            // so MathJax can measure and render into it before we snapshot
+            // its HTML for the server.
+            printContainer.style.cssText =
+                'display:block; position:fixed; left:-9999px; top:0; width:800px; background:#fff;';
 
             if (window.MathJax && MathJax.typesetPromise) {
                 try {
@@ -1120,10 +1124,67 @@ window.MathJax = {
                 }
             }
 
-            window.print();
-            window.addEventListener('afterprint', finish, { once: true });
-            // Fallback in case 'afterprint' never fires (some mobile browsers).
-            setTimeout(finish, 5000);
+            // Build a standalone HTML document — this project's own <style>
+            // blocks (including the @media print rules) plus the rendered
+            // printContainer markup — and hand it to the server, which
+            // renders it in headless Chromium and returns a real PDF file.
+            // This replaces window.print(): no OS print dialog step, so it
+            // behaves the same on phone and desktop, and math renders
+            // correctly because it's snapshotted after MathJax has already
+            // finished (the earlier garbling came from the browser's print
+            // layout pass, not from MathJax itself).
+            const printCss = Array.from(document.querySelectorAll('style'))
+                .map(s => s.outerHTML)
+                .join('\\n');
+
+            const standaloneHtml = `<!DOCTYPE html><html><head><meta charset="utf-8">
+                ${printCss}
+                <style>
+                  body{ background:#fff; }
+                  .print-only{ display:block !important; }
+                  #printContainer{ position:static !important; left:0 !important; width:auto !important; }
+                </style>
+              </head><body>
+                ${printContainer.outerHTML}
+                <script>window.__mathjaxDone = true;</script>
+              </body></html>`;
+
+            pdfStatus.textContent = 'Generating PDF on server...';
+
+            try {
+                const resp = await fetch('/api/pdf', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        html: standaloneHtml,
+                        filename: `NY_CODER_Paper_${paperId}`,
+                    }),
+                });
+
+                if (!resp.ok) {
+                    const errJson = await resp.json().catch(() => ({}));
+                    throw new Error(errJson.error || `HTTP ${resp.status}`);
+                }
+
+                const blob = await resp.blob();
+                const url = URL.createObjectURL(blob);
+
+                // A plain <a download> click is a real file download on
+                // every platform, phone browsers included, because there's
+                // no OS "print" step for them to handle inconsistently.
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `NY_CODER_Paper_${paperId}.pdf`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            } catch (err) {
+                pdfStatus.className = 'status error';
+                pdfStatus.textContent = `PDF generation failed: ${err.message}`;
+            } finally {
+                finish();
+            }
         }
 
         pdfBtn.addEventListener('click', handleDownloadPdf);
