@@ -715,6 +715,29 @@ window.MathJax = {
             return (userIdInput.value || '').trim() || '0000';
         }
 
+        // The upstream API returns question/option/solution text as a full,
+        // standalone "<html><head><title></title></head><body>...</body></html>"
+        // document string per field. When several such fragments get
+        // string-concatenated together and assigned to innerHTML in one shot
+        // (as the full-paper view and the PDF export both do, for many
+        // questions at once), any single malformed or inconsistently-closed
+        // tag in one fragment can corrupt how the browser parses everything
+        // that follows it in that combined string — producing exactly the
+        // kind of stray, misplaced characters/superscripts seen in exported
+        // PDFs. Parsing each fragment in isolation with DOMParser first (the
+        // way a full standalone document is meant to be parsed) and pulling
+        // out just its <body> contents avoids that cross-contamination
+        // entirely, regardless of how many fragments get joined afterward.
+        function extractFragmentHtml(raw) {
+            if (!raw) return '';
+            try {
+                const doc = new DOMParser().parseFromString(raw, 'text/html');
+                return doc.body ? doc.body.innerHTML : raw;
+            } catch (e) {
+                return raw;
+            }
+        }
+
         // Fetches a URL and always returns the parsed JSON body — even on a
         // non-2xx response — so upstream error text (surfaced by our own
         // /api* routes) makes it to the UI instead of a bare "HTTP 500".
@@ -807,12 +830,13 @@ window.MathJax = {
             const q = items[0];
             qidDisplay.textContent = `QID: ${q.qid}`;
             toughnessDisplay.textContent = q.toughness || '—';
-            qTextDisplay.innerHTML = q.q_text || '(empty)';
+            const cleanQText = extractFragmentHtml(q.q_text) || '(empty)';
+            qTextDisplay.innerHTML = cleanQText;
             currentSingleQuestion = {
                 qid: q.qid,
                 subject: q.subject || 'Maths',
                 toughness: q.toughness || '—',
-                q_text: q.q_text || '(empty)'
+                q_text: cleanQText
             };
 
             // Wire up the solution button for this question, resetting any
@@ -880,13 +904,13 @@ window.MathJax = {
                     const correct = Number(opt.is_correct) === 1;
                     html += `<div class="opt-box${correct ? ' correct' : ''}">
                         <span class="opt-letter">${optionLetter(i)}.</span>
-                        <span>${opt.option || ''}</span>
+                        <span>${extractFragmentHtml(opt.option)}</span>
                     </div>`;
                 });
                 html += '</div>';
             }
             html += '<div class="sol-heading">Solution</div>';
-            html += `<div class="sol-text">${record.sol_text || 'No written solution available for this question.'}</div>`;
+            html += `<div class="sol-text">${extractFragmentHtml(record.sol_text) || 'No written solution available for this question.'}</div>`;
             panelEl.innerHTML = html;
 
             if (window.MathJax && MathJax.typesetPromise) {
@@ -979,7 +1003,7 @@ window.MathJax = {
                 const record = item.record;
                 html += `<div class="pdf-question">`;
                 html += `<div><span class="pdf-qnum">Q${item.num}.</span><span class="pdf-qtag">${item.q.toughness || '—'}</span></div>`;
-                html += `<div class="pdf-qtext">${item.q.q_text || '(empty)'}</div>`;
+                html += `<div class="pdf-qtext">${extractFragmentHtml(item.q.q_text) || '(empty)'}</div>`;
 
                 if (record && !record.__error && Array.isArray(record.option) && record.option.length) {
                     html += '<div class="pdf-opts">';
@@ -987,7 +1011,7 @@ window.MathJax = {
                         const correct = Number(opt.is_correct) === 1;
                         html += `<div class="pdf-opt${correct ? ' pdf-correct' : ''}">
                             <span class="pdf-opt-letter">${optionLetter(i)}.</span>
-                            <span>${opt.option || ''}</span>
+                            <span>${extractFragmentHtml(opt.option)}</span>
                         </div>`;
                     });
                     html += '</div>';
@@ -1165,7 +1189,7 @@ window.MathJax = {
                         html += `<div class="question-item">`;
                         html += `<div class="qid">QID: ${q.qid}</div>`;
                         html += `<div class="toughness">${q.toughness || '—'}</div>`;
-                        html += `<div class="q-text">${q.q_text || '(empty)'}</div>`;
+                        html += `<div class="q-text">${extractFragmentHtml(q.q_text) || '(empty)'}</div>`;
                         html += `<button class="sol-btn" data-qid="${q.qid}" data-subject="${sub}">&gt; View Solution</button>`;
                         html += `<div class="sol-panel hidden"></div>`;
                         html += `</div>`;
