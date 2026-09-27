@@ -95,18 +95,32 @@ module.exports = async (req, res) => {
     await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
     await page.waitForFunction('window.__mathjaxDone === true', { timeout: 15000 }).catch(() => {});
 
-    const pdfBuffer = await page.pdf({
+    const pdfArray = await page.pdf({
       format: 'A4',
       printBackground: true,
       margin: { top: '18mm', bottom: '18mm', left: '16mm', right: '16mm' },
     });
+    // page.pdf() returns a Uint8Array in modern puppeteer-core, not a
+    // Node Buffer. res.send()/res.json() helpers don't recognize a plain
+    // Uint8Array as binary and will JSON-serialize it instead (producing
+    // a text file like {"0":37,"1":80,...} with a .pdf extension, which
+    // is exactly what "Failed to load PDF document" looks like). Wrapping
+    // it in Buffer.from() and writing with res.end() guarantees raw bytes
+    // go out on the wire.
+    const pdfBuffer = Buffer.from(pdfArray);
+
+    if (pdfBuffer.length === 0 || pdfBuffer.slice(0, 5).toString('latin1') !== '%PDF-') {
+      throw new Error(`page.pdf() did not return valid PDF bytes (length=${pdfBuffer.length})`);
+    }
 
     await browser.close();
 
     const safeName = (filename || 'question_paper').replace(/[^a-zA-Z0-9_\-]/g, '_');
+    res.statusCode = 200;
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}.pdf"`);
-    res.status(200).send(pdfBuffer);
+    res.setHeader('Content-Length', pdfBuffer.length);
+    res.end(pdfBuffer);
   } catch (err) {
     console.error('PDF generation failed:', err.stack || err);
     if (browser) await browser.close().catch(() => {});
