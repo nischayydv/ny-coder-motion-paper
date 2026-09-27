@@ -17,10 +17,10 @@ app = Flask(__name__)
 # ---------- Configuration ----------
 EXTERNAL_API = "https://learning.motion.ac.in/motioneducation/api/getsinglequestion"
 SOLUTION_API = "https://learning.motion.ac.in/motioneducation/api/getviewsolution"
-DEFAULT_PAPER_ID = 46921
+DEFAULT_PAPER_ID = 43643
 SUBJECTS = ["Maths", "Physics", "Chemistry"]
 PLANNER_TEST_ID = 0
-USER_ID = "833031"
+USER_ID = "0000"
 
 # Sent on every upstream call so requests look like they come from a real
 # browser session on the site itself, rather than a bare python-requests

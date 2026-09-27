@@ -1,7 +1,11 @@
 {
   "builds": [
     { "src": "api/index.py", "use": "@vercel/python" },
-    { "src": "api/pdf.js", "use": "@vercel/node" }
+    {
+      "src": "api/pdf.js",
+      "use": "@vercel/node",
+      "config": { "includeFiles": "node_modules/@sparticuz/chromium/**" }
+    }
   ],
   "routes": [
     { "src": "/api/pdf", "dest": "api/pdf.js" },
