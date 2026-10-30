@@ -3,9 +3,6 @@
 NY CODER :: Question Viewer — Vercel serverless entrypoint.
 Flask app exposed as `app`; Vercel's @vercel/python runtime auto-detects
 and serves any WSGI-compatible `app` object from api/index.py.
-
-Local dev:  vercel dev
-Deploy:     vercel --prod
 """
 
 from flask import Flask, request, jsonify, render_template_string
@@ -34,7 +31,6 @@ REQUEST_HEADERS = {
 
 
 def upstream_get(url, params):
-    """GET an upstream endpoint and return (ok, payload, http_status)."""
     try:
         resp = requests.get(url, params=params, headers=REQUEST_HEADERS, timeout=15)
     except requests.exceptions.RequestException as e:
@@ -183,7 +179,6 @@ def full_paper_api():
     )
 
 
-# ---------- HTML page (embedded, NY CODER theme) ----------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -409,14 +404,9 @@ HTML_TEMPLATE = """
         background: rgba(0,20,8,0.5); font-size:0.95em; display:flex; gap:10px; align-items:flex-start;
     }
     .opt-box .opt-letter{ color:var(--green-dim); font-weight:700; min-width:18px; }
-
-    /* Correct option: green fill + green border + CHECK badge.
-       Visible on screen and preserved by the print stylesheet. */
     .opt-box.correct{
-        border-color: var(--green);
-        background: rgba(0,255,65,0.14);
-        box-shadow: var(--green-glow);
-        font-weight: 600;
+        border-color: var(--green); background: rgba(0,255,65,0.14);
+        box-shadow: var(--green-glow); font-weight: 600;
     }
     .opt-box.correct .opt-letter{ color:var(--green); }
     .opt-box.correct::after{
@@ -451,18 +441,15 @@ HTML_TEMPLATE = """
 
     @media print {
         @page { margin: 18mm 16mm; }
-
         html, body{ height:auto; }
         body *{ visibility:hidden; }
         #matrixCanvas, .scanlines, .crt-flicker{ display:none !important; }
-
         #printContainer, #printContainer *{ visibility:visible; }
         #printContainer{
             display:block; position:absolute; inset:0; margin:0; padding:0;
             background:#ffffff; color:#1a1a1a;
             font-family: Georgia, 'Times New Roman', serif;
         }
-
         .pdf-header{
             display:flex; justify-content:space-between; align-items:flex-end;
             border-bottom:3px solid #1a1a1a; padding-bottom:10px; margin-bottom:18px;
@@ -476,7 +463,6 @@ HTML_TEMPLATE = """
             letter-spacing:1px; background:#f0f0f0; padding:6px 12px; margin:22px 0 12px 0;
             border-left:4px solid #1a1a1a;
         }
-
         .pdf-question{ margin-bottom:18px; page-break-inside: avoid; }
         .pdf-question .pdf-qnum{ font-weight:700; font-size:1.02em; }
         .pdf-question .pdf-qtag{
@@ -485,24 +471,18 @@ HTML_TEMPLATE = """
         }
         .pdf-question .pdf-qtext{ margin:6px 0 10px 0; line-height:1.5; }
         .pdf-question .pdf-qtext p{ margin:0.4em 0; }
-        .pdf-question img{ max-width:100%; height:auto; }
+        .pdf-question img{ max-width:100%; height:auto; min-height: 20px; }
 
         .pdf-opts{ display:grid; grid-template-columns: 1fr 1fr; gap:6px 18px; margin-left:6px; }
-
         .pdf-opt{
             font-family: Arial, sans-serif; font-size:0.95em; display:flex; gap:6px;
             align-items:flex-start; padding:2px 6px; border-radius:3px;
         }
         .pdf-opt .pdf-opt-letter{ font-weight:700; min-width:16px; }
-        .pdf-opt img{ max-width:100%; height:auto; }
+        .pdf-opt img{ max-width:100%; height:auto; min-height: 20px; }
 
-        /* Correct option: green fill + border + checkmark.
-           Survives greyscale printing because of the border + weight. */
         .pdf-opt.pdf-correct{
-            font-weight:700;
-            background:#e8f7ec;
-            border:1px solid #1e8a3c;
-            color:#0f4d1f;
+            font-weight:700; background:#e8f7ec; border:1px solid #1e8a3c; color:#0f4d1f;
         }
         .pdf-opt.pdf-correct .pdf-opt-letter::after{ content:" \\2713"; color:#1e8a3c; }
 
@@ -526,7 +506,6 @@ HTML_TEMPLATE = """
             grid-column: 1 / -1; font-weight:700; font-size:0.85em; text-transform:uppercase;
             color:#444; margin-top:8px;
         }
-
         .pdf-footer{
             margin-top:20px; padding-top:8px; border-top:1px solid #ccc;
             font-family: Arial, sans-serif; font-size:0.7em; color:#999; text-align:center;
@@ -542,7 +521,6 @@ HTML_TEMPLATE = """
 
 <div class="wrap">
   <div class="container">
-
     <div class="titlebar">
         <span class="dot red"></span>
         <span class="dot amber"></span>
@@ -552,7 +530,6 @@ HTML_TEMPLATE = """
     </div>
 
     <div class="content">
-
         <div class="brand">
             <h1 class="glitch" data-text="NY CODER">NY CODER</h1>
             <div class="subtitle">[ OSINT MODULE :: QUESTION EXTRACTION TERMINAL v2.7 ]</div>
@@ -577,14 +554,10 @@ HTML_TEMPLATE = """
                 <label><input type="radio" name="mode" value="full"> Full Dump</label>
             </div>
         </div>
-        <div class="subtitle" style="text-align:left; margin: -12px 0 16px 0;">
-            Tip: solutions/attempt-status are looked up per user on the upstream API — if <b>View Solution</b> errors out, try setting User_ID to your real account id instead of the default placeholder.
-        </div>
 
         <div id="status" class="status"></div>
         <div id="pdfStatus" class="status hidden"></div>
 
-        <!-- Single-question view -->
         <div id="singleView">
             <div class="question-box">
                 <div class="qid" id="qidDisplay">QID: —</div>
@@ -600,7 +573,6 @@ HTML_TEMPLATE = """
             <div class="page-info" id="pageInfo">Page 0 / 0</div>
         </div>
 
-        <!-- Full-paper view -->
         <div id="fullView" class="hidden">
             <div id="fullContent"></div>
         </div>
@@ -608,17 +580,15 @@ HTML_TEMPLATE = """
         <div class="footer-tag">
             <b>ACCESS GRANTED</b> :: Trace me if you can. || NY CODER © all rights reversed.
         </div>
-
     </div>
   </div>
 </div>
 
-<!-- Print-only, professionally formatted PDF/exam-paper layout. -->
 <div id="printContainer" class="print-only"></div>
 
 <script>
 window.MathJax = {
-    tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] },
+    tex: { inlineMath: [['$', '$'], ['\\\\(', '\\\\)']] },
     chtml: { fontURL: 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/output/chtml/fonts/woff-v2' }
 };
 </script>
@@ -674,11 +644,9 @@ window.MathJax = {
         const pdfBtn = document.getElementById('pdfBtn');
         const pdfStatus = document.getElementById('pdfStatus');
         const printContainer = document.getElementById('printContainer');
-
         const singleView = document.getElementById('singleView');
         const fullView = document.getElementById('fullView');
         const fullContent = document.getElementById('fullContent');
-
         const modeRadios = document.querySelectorAll('input[name="mode"]');
 
         let currentPage = 1;
@@ -689,16 +657,12 @@ window.MathJax = {
         let currentSingleQuestion = null;
         let lastFullPaperData = null;
 
-        const UPSTREAM_ORIGIN = 'https://learning.motion.ac.in';
-
         function switchMode(mode) {
             currentMode = mode;
             if (mode === 'single') {
                 singleView.classList.remove('hidden');
                 fullView.classList.add('hidden');
-                if (paperId > 0) {
-                    fetchQuestion(currentPage);
-                }
+                if (paperId > 0) fetchQuestion(currentPage);
             } else {
                 singleView.classList.add('hidden');
                 fullView.classList.remove('hidden');
@@ -708,9 +672,7 @@ window.MathJax = {
 
         modeRadios.forEach(radio => {
             radio.addEventListener('change', function() {
-                if (this.checked) {
-                    switchMode(this.value);
-                }
+                if (this.checked) switchMode(this.value);
             });
         });
 
@@ -718,10 +680,7 @@ window.MathJax = {
             return (userIdInput.value || '').trim() || '0000';
         }
 
-        // Parse an upstream HTML fragment in isolation (avoids cross-fragment
-        // corruption) AND rewrite every relative URL against the upstream
-        // origin so images resolve when the fragment is rendered inside the
-        // PDF renderer (which loads from about:blank).
+        // Bulletproof URL fixer and lazy-load handler
         function extractFragmentHtml(raw) {
             if (!raw) return '';
             try {
@@ -729,26 +688,57 @@ window.MathJax = {
                 const body = doc.body || doc.documentElement;
                 if (!body) return raw;
 
+                // 1. Handle lazy-loaded images
+                body.querySelectorAll('img').forEach(el => {
+                    if (!el.getAttribute('src')) {
+                        const lazySrc = el.getAttribute('data-src') || el.getAttribute('data-original') || el.getAttribute('data-lazy-src');
+                        if (lazySrc) el.setAttribute('src', lazySrc);
+                    }
+                });
+
+                // 2. Fix all URLs
                 body.querySelectorAll('img[src], source[src], a[href]').forEach(el => {
                     ['src', 'href'].forEach(attr => {
                         const v = el.getAttribute(attr);
                         if (!v) return;
-                        if (/^(https?:|data:|blob:|mailto:|#)/i.test(v)) return;
-                        el.setAttribute(attr, v.startsWith('/') ? UPSTREAM_ORIGIN + v : UPSTREAM_ORIGIN + '/' + v);
+                        
+                        if (/^(data:|blob:|mailto:|#)/i.test(v)) return;
+                        if (v.startsWith('//')) {
+                            el.setAttribute(attr, 'https:' + v);
+                            return;
+                        }
+                        if (/^https?:/i.test(v)) {
+                            if (v.startsWith('http://')) el.setAttribute(attr, v.replace('http://', 'https://'));
+                            return;
+                        }
+                        
+                        let absoluteUrl;
+                        if (v.startsWith('/')) {
+                            absoluteUrl = 'https://learning.motion.ac.in' + v;
+                        } else {
+                            absoluteUrl = 'https://learning.motion.ac.in/motioneducation/' + v;
+                        }
+                        el.setAttribute(attr, absoluteUrl);
                     });
+                    
                     const srcset = el.getAttribute('srcset');
                     if (srcset) {
                         el.setAttribute('srcset', srcset.split(',').map(part => {
                             const bits = part.trim().split(/\s+/);
                             let u = bits[0];
-                            if (!/^(https?:|data:|blob:)/i.test(u)) {
-                                u = u.startsWith('/') ? UPSTREAM_ORIGIN + u : UPSTREAM_ORIGIN + '/' + u;
+                            if (!/^(data:|blob:|\/\/)/i.test(u)) {
+                                if (/^http:/i.test(u)) {
+                                    u = u.replace('http://', 'https://');
+                                } else if (!/^https:/i.test(u)) {
+                                    u = u.startsWith('/') ? 'https://learning.motion.ac.in' + u : 'https://learning.motion.ac.in/motioneducation/' + u;
+                                }
+                            } else if (u.startsWith('//')) {
+                                u = 'https:' + u;
                             }
                             return [u, ...bits.slice(1)].join(' ');
                         }).join(', '));
                     }
                 });
-
                 return body.innerHTML;
             } catch (e) {
                 return raw;
@@ -762,14 +752,12 @@ window.MathJax = {
             } catch (networkErr) {
                 throw new Error(`Network error: ${networkErr.message}`);
             }
-
             let data = null;
             try {
                 data = await response.json();
             } catch (parseErr) {
                 throw new Error(`Bad response (HTTP ${response.status}): could not parse JSON`);
             }
-
             if (!response.ok || data.status !== 200) {
                 throw new Error(data.error || data.message || `HTTP ${response.status}`);
             }
@@ -784,11 +772,7 @@ window.MathJax = {
 
             try {
                 const params = new URLSearchParams({
-                    paper_id: paperId,
-                    page: page,
-                    subject: 'Maths',
-                    planner_test_id: 0,
-                    user_id: currentUserId()
+                    paper_id: paperId, page: page, subject: 'Maths', planner_test_id: 0, user_id: currentUserId()
                 });
                 const data = await fetchJSON(`/api?${params.toString()}`);
                 renderSingle(data);
@@ -797,8 +781,7 @@ window.MathJax = {
             } catch (err) {
                 statusDiv.textContent = `Error: ${err.message}`;
                 statusDiv.className = 'status error';
-                prevBtn.disabled = true;
-                nextBtn.disabled = true;
+                prevBtn.disabled = true; nextBtn.disabled = true;
                 pageInfo.textContent = 'Page 0 / 0';
                 qidDisplay.textContent = 'QID: —';
                 toughnessDisplay.textContent = '—';
@@ -815,8 +798,7 @@ window.MathJax = {
                 toughnessDisplay.textContent = '—';
                 qTextDisplay.innerHTML = 'No question data.';
                 pageInfo.textContent = 'Page 0 / 0';
-                prevBtn.disabled = true;
-                nextBtn.disabled = true;
+                prevBtn.disabled = true; nextBtn.disabled = true;
                 singleSolBtn.classList.add('hidden');
                 singleSolPanel.classList.add('hidden');
                 currentSingleQuestion = null;
@@ -847,10 +829,7 @@ window.MathJax = {
             const cleanQText = extractFragmentHtml(q.q_text) || '(empty)';
             qTextDisplay.innerHTML = cleanQText;
             currentSingleQuestion = {
-                qid: q.qid,
-                subject: q.subject || 'Maths',
-                toughness: q.toughness || '—',
-                q_text: cleanQText
+                qid: q.qid, subject: q.subject || 'Maths', toughness: q.toughness || '—', q_text: cleanQText
             };
 
             singleSolBtn.dataset.qid = q.qid;
@@ -865,18 +844,10 @@ window.MathJax = {
             }
         }
 
-        // ---------- Solution feature ----------
         const solutionCache = {};
 
-        function optionLetter(i) {
-            return String.fromCharCode(65 + i);
-        }
+        function optionLetter(i) { return String.fromCharCode(65 + i); }
 
-        // Normalise upstream option shape. Handles all variants observed:
-        //   { option:"<html>", is_correct:1 }
-        //   { text:"<html>",   is_correct:"1" }
-        //   { option_text:"…", correct:true }
-        //   { option:{html:"…"}, is_correct:1 }
         function normaliseOptions(record) {
             if (!record || record.__error) return [];
             const raw = record.option || record.options || [];
@@ -889,27 +860,16 @@ window.MathJax = {
                     text = o.option ?? o.text ?? o.option_text ?? o.value ?? '';
                     if (text && typeof text === 'object') text = text.html ?? text.text ?? '';
                 }
-                const correct =
-                    Number(o && o.is_correct) === 1 ||
-                    String(o && o.is_correct) === '1' ||
-                    (o && o.is_correct === true) ||
-                    (o && o.correct === true) ||
-                    Number(o && o.correct) === 1;
+                const correct = Number(o && o.is_correct) === 1 || String(o && o.is_correct) === '1' || o && o.is_correct === true || o && o.correct === true || Number(o && o.correct) === 1;
                 return { text: String(text || ''), correct };
             });
         }
 
         async function fetchSolutionRecord(qid, subject) {
-            if (Object.prototype.hasOwnProperty.call(solutionCache, qid)) {
-                return solutionCache[qid];
-            }
+            if (Object.prototype.hasOwnProperty.call(solutionCache, qid)) return solutionCache[qid];
             try {
                 const params = new URLSearchParams({
-                    subject: subject || 'Maths',
-                    paper_id: paperId,
-                    planner_test_id: 0,
-                    user_id: currentUserId(),
-                    qid: qid
+                    subject: subject || 'Maths', paper_id: paperId, planner_test_id: 0, user_id: currentUserId(), qid: qid
                 });
                 const data = await fetchJSON(`/api/solution?${params.toString()}`);
                 const record = (data.data && data.data[0]) || null;
@@ -961,7 +921,6 @@ window.MathJax = {
                 btnEl.classList.remove('open');
                 return;
             }
-
             panelEl.classList.remove('hidden');
             btnEl.textContent = '> Hide Solution';
             btnEl.classList.add('open');
@@ -971,27 +930,22 @@ window.MathJax = {
                 renderSolutionPanel(panelEl, cached);
                 return;
             }
-
             panelEl.innerHTML = '<div class="sol-loading">decrypting solution payload</div>';
             const record = await fetchSolutionRecord(qid, subject);
             renderSolutionPanel(panelEl, record);
         }
 
         singleSolBtn.addEventListener('click', function() {
-            const qid = this.dataset.qid;
-            const subject = this.dataset.subject;
-            if (!qid) return;
-            fetchSolution(qid, subject, singleSolBtn, singleSolPanel);
+            if (!this.dataset.qid) return;
+            fetchSolution(this.dataset.qid, this.dataset.subject, singleSolBtn, singleSolPanel);
         });
 
         fullContent.addEventListener('click', function(e) {
             const btn = e.target.closest('.sol-btn');
             if (!btn) return;
-            const panel = btn.nextElementSibling;
-            fetchSolution(btn.dataset.qid, btn.dataset.subject, btn, panel);
+            fetchSolution(btn.dataset.qid, btn.dataset.subject, btn, btn.nextElementSibling);
         });
 
-        // ---------- PDF export ----------
         async function mapWithConcurrency(items, limit, worker) {
             const results = new Array(items.length);
             let nextIndex = 0;
@@ -1015,7 +969,6 @@ window.MathJax = {
 
         function buildPrintHtml(numbered, meta) {
             let html = '';
-
             html += `<div class="pdf-header">
                 <div class="pdf-brand">NY <span>CODER</span></div>
                 <div class="pdf-meta">
@@ -1031,7 +984,6 @@ window.MathJax = {
                     html += `<div class="pdf-subject-title">${item.subject}</div>`;
                     lastSubject = item.subject;
                 }
-
                 const record = item.record;
                 html += `<div class="pdf-question">`;
                 html += `<div><span class="pdf-qnum">Q${item.num}.</span><span class="pdf-qtag">${item.q.toughness || '—'}</span></div>`;
@@ -1052,7 +1004,6 @@ window.MathJax = {
                 } else {
                     html += `<div class="pdf-opt-unavailable">No options data available for QID ${item.q.qid}.</div>`;
                 }
-
                 html += `</div>`;
             });
 
@@ -1067,9 +1018,7 @@ window.MathJax = {
                 html += `<div class="pdf-key-cell">Q${item.num}: <b>${letter || '—'}</b></div>`;
             });
             html += `</div></div>`;
-
             html += `<div class="pdf-footer">NY CODER :: Question Extraction Terminal — Paper ${meta.paperId} — generated ${meta.date}</div>`;
-
             return html;
         }
 
@@ -1124,9 +1073,7 @@ window.MathJax = {
             });
 
             printContainer.innerHTML = buildPrintHtml(numbered, {
-                paperId: paperId,
-                userId: currentUserId(),
-                date: new Date().toLocaleString()
+                paperId: paperId, userId: currentUserId(), date: new Date().toLocaleString()
             });
 
             pdfStatus.textContent = 'Rendering equations...';
@@ -1138,8 +1085,7 @@ window.MathJax = {
                 printContainer.style.cssText = '';
             };
 
-            printContainer.style.cssText =
-                'display:block; position:fixed; left:-9999px; top:0; width:800px; background:#fff;';
+            printContainer.style.cssText = 'display:block; position:fixed; left:-9999px; top:0; width:800px; background:#fff;';
 
             if (window.MathJax && MathJax.typesetPromise) {
                 try {
@@ -1149,44 +1095,45 @@ window.MathJax = {
                 }
             }
 
-            const printCss = Array.from(document.querySelectorAll('style'))
-                .map(s => s.outerHTML)
-                .join('\\n');
+            const printCss = Array.from(document.querySelectorAll('style')).map(s => s.outerHTML).join('\\n');
 
-            // The __mathjaxDone flag is now set only AFTER MathJax has
-            // finished in the standalone document. pdf.js polls it.
-            const standaloneHtml = `<!DOCTYPE html><html><head><meta charset="utf-8">
+            // Inject MathJax AND base URL directly into the standalone HTML sent to Puppeteer
+            const standaloneHtml = `<!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <base href="https://learning.motion.ac.in/motioneducation/">
                 ${printCss}
                 <style>
-                  body{ background:#fff; }
+                  body{ background:#fff; padding:0; margin:0; }
                   .print-only{ display:block !important; }
-                  #printContainer{ position:static !important; left:0 !important; width:auto !important; }
-                  img{ max-width:100%; height:auto; }
+                  #printContainer{ position:static !important; left:0 !important; width:auto !important; padding:0; margin:0; }
+                  img{ max-width:100%; height:auto; min-height: 20px; }
                 </style>
-              </head><body>
+                <script>
+                  window.MathJax = {
+                      tex: { inlineMath: [['$', '$'], ['\\\\(', '\\\\)']] },
+                      chtml: { fontURL: 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/output/chtml/fonts/woff-v2' },
+                      startup: {
+                          pageReady: () => {
+                              return MathJax.startup.defaultPageReady().then(() => {
+                                  window.__mathjaxDone = true;
+                              });
+                          }
+                      }
+                  };
+                </script>
+                <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" id="MathJax-script" async></script>
+            </head>
+            <body>
                 ${printContainer.outerHTML}
                 <script>
-                  (function waitForMj(){
-                    var tries = 0;
-                    function tick(){
-                      tries++;
-                      var mj = window.MathJax;
-                      if (mj && mj.typesetPromise) {
-                        mj.typesetPromise().then(function(){
-                          window.__mathjaxDone = true;
-                        }).catch(function(){
-                          window.__mathjaxDone = true;
-                        });
-                      } else if (tries > 100) {
-                        window.__mathjaxDone = true;
-                      } else {
-                        setTimeout(tick, 100);
-                      }
-                    }
-                    tick();
-                  })();
-                <\/script>
-              </body></html>`;
+                    setTimeout(function() {
+                        if (!window.__mathjaxDone) window.__mathjaxDone = true;
+                    }, 15000);
+                </script>
+            </body>
+            </html>`;
 
             pdfStatus.textContent = 'Generating PDF on server...';
 
@@ -1194,10 +1141,7 @@ window.MathJax = {
                 const resp = await fetch('/api/pdf', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        html: standaloneHtml,
-                        filename: `NY_CODER_Paper_${paperId}`,
-                    }),
+                    body: JSON.stringify({ html: standaloneHtml, filename: `NY_CODER_Paper_${paperId}` }),
                 });
 
                 if (!resp.ok) {
@@ -1207,7 +1151,6 @@ window.MathJax = {
 
                 const blob = await resp.blob();
                 const url = URL.createObjectURL(blob);
-
                 const a = document.createElement('a');
                 a.href = url;
                 a.download = `NY_CODER_Paper_${paperId}.pdf`;
@@ -1230,7 +1173,6 @@ window.MathJax = {
             isLoading = true;
             statusDiv.textContent = 'Loading full paper...';
             statusDiv.className = 'status loading';
-
             try {
                 const params = new URLSearchParams({ paper_id: paperId, user_id: currentUserId() });
                 const data = await fetchJSON(`/api/full_paper?${params.toString()}`);
@@ -1251,10 +1193,8 @@ window.MathJax = {
             lastFullPaperData = data;
             const subjects = data.subjects || {};
             let html = '';
-
             let summary = `<div style="background:rgba(0,255,65,0.05);padding:12px 20px;border-radius:8px;margin-bottom:20px;border:1px solid var(--border);">
-                <strong>Paper ID: ${data.paper_id}</strong> &nbsp;|&nbsp;
-            `;
+                <strong>Paper ID: ${data.paper_id}</strong> &nbsp;|&nbsp;`;
             for (const sub of ['Maths', 'Physics', 'Chemistry']) {
                 const info = subjects[sub];
                 const count = info ? info.count : 0;
@@ -1294,9 +1234,7 @@ window.MathJax = {
                 }
                 html += `</div>`;
             }
-
             fullContent.innerHTML = html;
-
             if (window.MathJax && MathJax.typesetPromise) {
                 MathJax.typesetPromise([fullContent]).catch(err => console.warn('MathJax error:', err));
             }
@@ -1316,11 +1254,8 @@ window.MathJax = {
             }
             paperId = newId;
             currentPage = 1;
-            if (currentMode === 'single') {
-                fetchQuestion(1);
-            } else {
-                fetchFullPaper();
-            }
+            if (currentMode === 'single') fetchQuestion(1);
+            else fetchFullPaper();
         }
 
         goBtn.addEventListener('click', resetAndFetch);
@@ -1348,12 +1283,7 @@ window.MathJax = {
 </html>
 """
 
-
 @app.route("/")
 def index():
     """Serve the main HTML page."""
     return render_template_string(HTML_TEMPLATE, default_paper=DEFAULT_PAPER_ID, default_user_id=USER_ID)
-
-
-# Note: no app.run() here — Vercel's @vercel/python runtime imports this
-# module and calls the WSGI `app` object directly per-request.
