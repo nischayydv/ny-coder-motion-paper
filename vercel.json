@@ -1,12 +1,10 @@
 {
   "functions": {
     "api/index.py": {
-      "runtime": "@vercel/python@4.3.0",
       "memory": 512,
       "maxDuration": 30
     },
     "api/pdf.js": {
-      "runtime": "@vercel/node@3.0.27",
       "memory": 1024,
       "maxDuration": 60,
       "includeFiles": "node_modules/@sparticuz/chromium/**"
