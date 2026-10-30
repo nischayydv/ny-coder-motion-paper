@@ -22,10 +22,6 @@ SUBJECTS = ["Maths", "Physics", "Chemistry"]
 PLANNER_TEST_ID = 0
 USER_ID = "833031"
 
-# Sent on every upstream call so requests look like they come from a real
-# browser session on the site itself, rather than a bare python-requests
-# client — some endpoints on this API (notably getviewsolution) are pickier
-# about this than the plain question-listing endpoint.
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -38,16 +34,7 @@ REQUEST_HEADERS = {
 
 
 def upstream_get(url, params):
-    """
-    GET an upstream endpoint and return (ok, payload, http_status).
-
-    Unlike a bare requests.get + raise_for_status(), this:
-    - always tries to read a body, even on non-2xx, since this API sometimes
-      puts a real error message in a JSON body alongside a non-200 status
-    - reports upstream network failures, non-JSON bodies (e.g. a WAF/CDN
-      HTML challenge page), and non-2xx statuses with distinct, readable
-      messages instead of collapsing everything into an opaque "HTTP 500"
-    """
+    """GET an upstream endpoint and return (ok, payload, http_status)."""
     try:
         resp = requests.get(url, params=params, headers=REQUEST_HEADERS, timeout=15)
     except requests.exceptions.RequestException as e:
@@ -57,11 +44,6 @@ def upstream_get(url, params):
         payload = resp.json()
     except ValueError:
         snippet = resp.text[:300].replace("\n", " ").strip()
-        # A non-JSON body is always a failure from our point of view, even if
-        # the upstream returned HTTP 200 (some WAF/CDN challenge pages do).
-        # Use the upstream status if it already signals an error; otherwise
-        # report it as a Bad Gateway so the caller doesn't mistake this for
-        # a real 200 success.
         reported_status = resp.status_code if resp.status_code >= 400 else 502
         return False, {
             "status": reported_status,
@@ -80,7 +62,6 @@ def upstream_get(url, params):
     return True, payload, resp.status_code
 
 
-# ---------- Helper: fetch all pages for one subject ----------
 def fetch_all_pages_for_subject(paper_id, subject, user_id):
     all_questions = []
     page = 1
@@ -123,7 +104,6 @@ def fetch_all_pages_for_subject(paper_id, subject, user_id):
     }
 
 
-# ---------- Proxy endpoint for single question (legacy) ----------
 @app.route("/api")
 def proxy_api():
     paper_id = request.args.get("paper_id", DEFAULT_PAPER_ID)
@@ -146,7 +126,6 @@ def proxy_api():
     return jsonify(payload)
 
 
-# ---------- Proxy endpoint for a question's solution ----------
 @app.route("/api/solution")
 def solution_api():
     qid = request.args.get("qid")
@@ -172,7 +151,6 @@ def solution_api():
     return jsonify(payload)
 
 
-# ---------- Full paper (all subjects, all pages) ----------
 @app.route("/api/full_paper")
 def full_paper_api():
     paper_id = request.args.get("paper_id", DEFAULT_PAPER_ID)
@@ -203,7 +181,6 @@ def full_paper_api():
             "subjects": results,
         }
     )
-
 
 
 # ---------- HTML page (embedded, NY CODER theme) ----------
@@ -432,12 +409,20 @@ HTML_TEMPLATE = """
         background: rgba(0,20,8,0.5); font-size:0.95em; display:flex; gap:10px; align-items:flex-start;
     }
     .opt-box .opt-letter{ color:var(--green-dim); font-weight:700; min-width:18px; }
+
+    /* Correct option: green fill + green border + CHECK badge.
+       Visible on screen and preserved by the print stylesheet. */
     .opt-box.correct{
-        border-color: var(--green); background: rgba(0,255,65,0.1);
+        border-color: var(--green);
+        background: rgba(0,255,65,0.14);
         box-shadow: var(--green-glow);
+        font-weight: 600;
     }
     .opt-box.correct .opt-letter{ color:var(--green); }
-    .opt-box.correct::after{ content:"✔ CORRECT"; margin-left:auto; font-size:0.7em; color:var(--green); letter-spacing:1px; }
+    .opt-box.correct::after{
+        content:"✔ CORRECT"; margin-left:auto; font-size:0.7em;
+        color:var(--green); letter-spacing:1px; white-space:nowrap;
+    }
 
     .sol-heading{
         color:var(--amber); text-transform:uppercase; letter-spacing:2px; font-size:0.85em;
@@ -461,7 +446,7 @@ HTML_TEMPLATE = """
     ::-webkit-scrollbar-thumb{ background: var(--border); border-radius:5px; }
     ::-webkit-scrollbar-thumb:hover{ background: var(--green-dim); }
 
-    /* ---------- Print-only exam-paper layout (Download PDF feature) ---------- */
+    /* ---------- Print-only exam-paper layout ---------- */
     .print-only{ display:none; }
 
     @media print {
@@ -500,13 +485,31 @@ HTML_TEMPLATE = """
         }
         .pdf-question .pdf-qtext{ margin:6px 0 10px 0; line-height:1.5; }
         .pdf-question .pdf-qtext p{ margin:0.4em 0; }
+        .pdf-question img{ max-width:100%; height:auto; }
 
         .pdf-opts{ display:grid; grid-template-columns: 1fr 1fr; gap:6px 18px; margin-left:6px; }
-        .pdf-opt{ font-family: Arial, sans-serif; font-size:0.95em; display:flex; gap:6px; }
+
+        .pdf-opt{
+            font-family: Arial, sans-serif; font-size:0.95em; display:flex; gap:6px;
+            align-items:flex-start; padding:2px 6px; border-radius:3px;
+        }
         .pdf-opt .pdf-opt-letter{ font-weight:700; min-width:16px; }
-        .pdf-opt.pdf-correct{ font-weight:700; }
-        .pdf-opt.pdf-correct .pdf-opt-letter::after{ content:" \\2713"; }
-        .pdf-opt-unavailable{ font-family: Arial, sans-serif; font-size:0.8em; color:#888; font-style:italic; margin-left:6px; }
+        .pdf-opt img{ max-width:100%; height:auto; }
+
+        /* Correct option: green fill + border + checkmark.
+           Survives greyscale printing because of the border + weight. */
+        .pdf-opt.pdf-correct{
+            font-weight:700;
+            background:#e8f7ec;
+            border:1px solid #1e8a3c;
+            color:#0f4d1f;
+        }
+        .pdf-opt.pdf-correct .pdf-opt-letter::after{ content:" \\2713"; color:#1e8a3c; }
+
+        .pdf-opt-unavailable{
+            font-family: Arial, sans-serif; font-size:0.8em; color:#888;
+            font-style:italic; margin-left:6px;
+        }
 
         .pdf-answer-key{ margin-top:30px; page-break-before: always; }
         .pdf-answer-key h2{
@@ -610,9 +613,7 @@ HTML_TEMPLATE = """
   </div>
 </div>
 
-<!-- Print-only, professionally formatted PDF/exam-paper layout.
-     Hidden on screen; @media print swaps visibility so this is the only
-     thing that ends up in the generated PDF when the user hits Download PDF. -->
+<!-- Print-only, professionally formatted PDF/exam-paper layout. -->
 <div id="printContainer" class="print-only"></div>
 
 <script>
@@ -685,8 +686,10 @@ window.MathJax = {
         let paperId = parseInt(paperInput.value) || {{ default_paper }};
         let isLoading = false;
         let currentMode = 'single';
-        let currentSingleQuestion = null; // { qid, subject, toughness, q_text } for the on-screen single question
-        let lastFullPaperData = null;      // last successful /api/full_paper response, for PDF export
+        let currentSingleQuestion = null;
+        let lastFullPaperData = null;
+
+        const UPSTREAM_ORIGIN = 'https://learning.motion.ac.in';
 
         function switchMode(mode) {
             currentMode = mode;
@@ -715,32 +718,43 @@ window.MathJax = {
             return (userIdInput.value || '').trim() || '0000';
         }
 
-        // The upstream API returns question/option/solution text as a full,
-        // standalone "<html><head><title></title></head><body>...</body></html>"
-        // document string per field. When several such fragments get
-        // string-concatenated together and assigned to innerHTML in one shot
-        // (as the full-paper view and the PDF export both do, for many
-        // questions at once), any single malformed or inconsistently-closed
-        // tag in one fragment can corrupt how the browser parses everything
-        // that follows it in that combined string — producing exactly the
-        // kind of stray, misplaced characters/superscripts seen in exported
-        // PDFs. Parsing each fragment in isolation with DOMParser first (the
-        // way a full standalone document is meant to be parsed) and pulling
-        // out just its <body> contents avoids that cross-contamination
-        // entirely, regardless of how many fragments get joined afterward.
+        // Parse an upstream HTML fragment in isolation (avoids cross-fragment
+        // corruption) AND rewrite every relative URL against the upstream
+        // origin so images resolve when the fragment is rendered inside the
+        // PDF renderer (which loads from about:blank).
         function extractFragmentHtml(raw) {
             if (!raw) return '';
             try {
                 const doc = new DOMParser().parseFromString(raw, 'text/html');
-                return doc.body ? doc.body.innerHTML : raw;
+                const body = doc.body || doc.documentElement;
+                if (!body) return raw;
+
+                body.querySelectorAll('img[src], source[src], a[href]').forEach(el => {
+                    ['src', 'href'].forEach(attr => {
+                        const v = el.getAttribute(attr);
+                        if (!v) return;
+                        if (/^(https?:|data:|blob:|mailto:|#)/i.test(v)) return;
+                        el.setAttribute(attr, v.startsWith('/') ? UPSTREAM_ORIGIN + v : UPSTREAM_ORIGIN + '/' + v);
+                    });
+                    const srcset = el.getAttribute('srcset');
+                    if (srcset) {
+                        el.setAttribute('srcset', srcset.split(',').map(part => {
+                            const bits = part.trim().split(/\s+/);
+                            let u = bits[0];
+                            if (!/^(https?:|data:|blob:)/i.test(u)) {
+                                u = u.startsWith('/') ? UPSTREAM_ORIGIN + u : UPSTREAM_ORIGIN + '/' + u;
+                            }
+                            return [u, ...bits.slice(1)].join(' ');
+                        }).join(', '));
+                    }
+                });
+
+                return body.innerHTML;
             } catch (e) {
                 return raw;
             }
         }
 
-        // Fetches a URL and always returns the parsed JSON body — even on a
-        // non-2xx response — so upstream error text (surfaced by our own
-        // /api* routes) makes it to the UI instead of a bare "HTTP 500".
         async function fetchJSON(url) {
             let response;
             try {
@@ -839,8 +853,6 @@ window.MathJax = {
                 q_text: cleanQText
             };
 
-            // Wire up the solution button for this question, resetting any
-            // previously-open panel from the last question viewed.
             singleSolBtn.dataset.qid = q.qid;
             singleSolBtn.dataset.subject = q.subject || 'Maths';
             singleSolBtn.textContent = '> View Solution';
@@ -853,17 +865,40 @@ window.MathJax = {
             }
         }
 
-        // ---------- Solution feature (shared by single view, full view, and PDF export) ----------
-        const solutionCache = {}; // qid -> parsed solution record | { __error: message }
+        // ---------- Solution feature ----------
+        const solutionCache = {};
 
         function optionLetter(i) {
-            return String.fromCharCode(65 + i); // 0 -> A, 1 -> B, ...
+            return String.fromCharCode(65 + i);
         }
 
-        // Fetches (and caches) the options + correct-answer + solution record
-        // for one question. Shared by the "View Solution" panel and the PDF
-        // export, so a question the user already expanded on screen won't be
-        // re-fetched when building the PDF, and vice versa.
+        // Normalise upstream option shape. Handles all variants observed:
+        //   { option:"<html>", is_correct:1 }
+        //   { text:"<html>",   is_correct:"1" }
+        //   { option_text:"…", correct:true }
+        //   { option:{html:"…"}, is_correct:1 }
+        function normaliseOptions(record) {
+            if (!record || record.__error) return [];
+            const raw = record.option || record.options || [];
+            if (!Array.isArray(raw)) return [];
+            return raw.map((o) => {
+                if (o == null) return { text: '', correct: false };
+                let text = '';
+                if (typeof o === 'string') text = o;
+                else if (typeof o === 'object') {
+                    text = o.option ?? o.text ?? o.option_text ?? o.value ?? '';
+                    if (text && typeof text === 'object') text = text.html ?? text.text ?? '';
+                }
+                const correct =
+                    Number(o && o.is_correct) === 1 ||
+                    String(o && o.is_correct) === '1' ||
+                    (o && o.is_correct === true) ||
+                    (o && o.correct === true) ||
+                    Number(o && o.correct) === 1;
+                return { text: String(text || ''), correct };
+            });
+        }
+
         async function fetchSolutionRecord(qid, subject) {
             if (Object.prototype.hasOwnProperty.call(solutionCache, qid)) {
                 return solutionCache[qid];
@@ -896,15 +931,15 @@ window.MathJax = {
                 panelEl.innerHTML = `<div class="sol-error">Error: ${record.__error}</div>`;
                 return;
             }
-            const opts = record.option || [];
+            const opts = normaliseOptions(record);
             let html = '';
             if (opts.length) {
                 html += '<div class="opt-grid">';
                 opts.forEach((opt, i) => {
-                    const correct = Number(opt.is_correct) === 1;
-                    html += `<div class="opt-box${correct ? ' correct' : ''}">
+                    const cls = opt.correct ? ' correct' : '';
+                    html += `<div class="opt-box${cls}">
                         <span class="opt-letter">${optionLetter(i)}.</span>
-                        <span>${extractFragmentHtml(opt.option)}</span>
+                        <span>${extractFragmentHtml(opt.text) || '<em>(option text unavailable)</em>'}</span>
                     </div>`;
                 });
                 html += '</div>';
@@ -949,7 +984,6 @@ window.MathJax = {
             fetchSolution(qid, subject, singleSolBtn, singleSolPanel);
         });
 
-        // Event delegation for solution buttons rendered inside the full-paper view
         fullContent.addEventListener('click', function(e) {
             const btn = e.target.closest('.sol-btn');
             if (!btn) return;
@@ -957,10 +991,7 @@ window.MathJax = {
             fetchSolution(btn.dataset.qid, btn.dataset.subject, btn, panel);
         });
 
-        // ---------- PDF export ("Download PDF") ----------
-        // Runs a list of async jobs with a concurrency cap so we don't fire
-        // 40+ simultaneous requests at the upstream API when exporting a
-        // full paper.
+        // ---------- PDF export ----------
         async function mapWithConcurrency(items, limit, worker) {
             const results = new Array(items.length);
             let nextIndex = 0;
@@ -976,8 +1007,9 @@ window.MathJax = {
         }
 
         function correctLetterFor(record) {
-            if (!record || record.__error || !Array.isArray(record.option)) return null;
-            const idx = record.option.findIndex(o => Number(o.is_correct) === 1);
+            const opts = normaliseOptions(record);
+            if (!opts.length) return null;
+            const idx = opts.findIndex(o => o.correct);
             return idx >= 0 ? optionLetter(idx) : null;
         }
 
@@ -1005,13 +1037,13 @@ window.MathJax = {
                 html += `<div><span class="pdf-qnum">Q${item.num}.</span><span class="pdf-qtag">${item.q.toughness || '—'}</span></div>`;
                 html += `<div class="pdf-qtext">${extractFragmentHtml(item.q.q_text) || '(empty)'}</div>`;
 
-                if (record && !record.__error && Array.isArray(record.option) && record.option.length) {
+                const opts = normaliseOptions(record);
+                if (opts.length) {
                     html += '<div class="pdf-opts">';
-                    record.option.forEach((opt, i) => {
-                        const correct = Number(opt.is_correct) === 1;
-                        html += `<div class="pdf-opt${correct ? ' pdf-correct' : ''}">
+                    opts.forEach((opt, i) => {
+                        html += `<div class="pdf-opt${opt.correct ? ' pdf-correct' : ''}">
                             <span class="pdf-opt-letter">${optionLetter(i)}.</span>
-                            <span>${extractFragmentHtml(opt.option)}</span>
+                            <span>${extractFragmentHtml(opt.text) || '<em>(option text unavailable)</em>'}</span>
                         </div>`;
                     });
                     html += '</div>';
@@ -1024,7 +1056,6 @@ window.MathJax = {
                 html += `</div>`;
             });
 
-            // Answer key, grouped by subject, at the end.
             html += `<div class="pdf-answer-key"><h2>Answer Key</h2><div class="pdf-key-grid">`;
             lastSubject = null;
             numbered.forEach(item => {
@@ -1045,8 +1076,6 @@ window.MathJax = {
         async function handleDownloadPdf() {
             if (pdfBtn.disabled) return;
 
-            // Build a subject-grouped, sequentially-numbered question list
-            // from whichever view is currently active.
             let groups = [];
             if (currentMode === 'single') {
                 if (!currentSingleQuestion) {
@@ -1106,13 +1135,9 @@ window.MathJax = {
                 pdfBtn.disabled = false;
                 pdfBtn.textContent = originalBtnText;
                 pdfStatus.classList.add('hidden');
-                printContainer.style.cssText = ''; // back to display:none via .print-only
+                printContainer.style.cssText = '';
             };
 
-            // printContainer is normally display:none (shown only via
-            // @media print). We need it laid out — even if off-screen —
-            // so MathJax can measure and render into it before we snapshot
-            // its HTML for the server.
             printContainer.style.cssText =
                 'display:block; position:fixed; left:-9999px; top:0; width:800px; background:#fff;';
 
@@ -1124,29 +1149,43 @@ window.MathJax = {
                 }
             }
 
-            // Build a standalone HTML document — this project's own <style>
-            // blocks (including the @media print rules) plus the rendered
-            // printContainer markup — and hand it to the server, which
-            // renders it in headless Chromium and returns a real PDF file.
-            // This replaces window.print(): no OS print dialog step, so it
-            // behaves the same on phone and desktop, and math renders
-            // correctly because it's snapshotted after MathJax has already
-            // finished (the earlier garbling came from the browser's print
-            // layout pass, not from MathJax itself).
             const printCss = Array.from(document.querySelectorAll('style'))
                 .map(s => s.outerHTML)
                 .join('\\n');
 
+            // The __mathjaxDone flag is now set only AFTER MathJax has
+            // finished in the standalone document. pdf.js polls it.
             const standaloneHtml = `<!DOCTYPE html><html><head><meta charset="utf-8">
                 ${printCss}
                 <style>
                   body{ background:#fff; }
                   .print-only{ display:block !important; }
                   #printContainer{ position:static !important; left:0 !important; width:auto !important; }
+                  img{ max-width:100%; height:auto; }
                 </style>
               </head><body>
                 ${printContainer.outerHTML}
-                <script>window.__mathjaxDone = true;<${''}/script>
+                <script>
+                  (function waitForMj(){
+                    var tries = 0;
+                    function tick(){
+                      tries++;
+                      var mj = window.MathJax;
+                      if (mj && mj.typesetPromise) {
+                        mj.typesetPromise().then(function(){
+                          window.__mathjaxDone = true;
+                        }).catch(function(){
+                          window.__mathjaxDone = true;
+                        });
+                      } else if (tries > 100) {
+                        window.__mathjaxDone = true;
+                      } else {
+                        setTimeout(tick, 100);
+                      }
+                    }
+                    tick();
+                  })();
+                <\/script>
               </body></html>`;
 
             pdfStatus.textContent = 'Generating PDF on server...';
@@ -1169,9 +1208,6 @@ window.MathJax = {
                 const blob = await resp.blob();
                 const url = URL.createObjectURL(blob);
 
-                // A plain <a download> click is a real file download on
-                // every platform, phone browsers included, because there's
-                // no OS "print" step for them to handle inconsistently.
                 const a = document.createElement('a');
                 a.href = url;
                 a.download = `NY_CODER_Paper_${paperId}.pdf`;
@@ -1320,5 +1356,4 @@ def index():
 
 
 # Note: no app.run() here — Vercel's @vercel/python runtime imports this
-# module and calls the WSGI `app` object directly per-request. Keep this
-# file's top-level `app` name unchanged.
+# module and calls the WSGI `app` object directly per-request.
