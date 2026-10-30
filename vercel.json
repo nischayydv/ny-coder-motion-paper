@@ -10,5 +10,9 @@
   "routes": [
     { "src": "/api/pdf", "dest": "api/pdf.js" },
     { "src": "/(.*)", "dest": "api/index.py" }
-  ]
+  ],
+  "functions": {
+    "api/pdf.js": { "memory": 1024, "maxDuration": 60 },
+    "api/index.py": { "memory": 512, "maxDuration": 30 }
+  }
 }
