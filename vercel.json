@@ -1,18 +1,19 @@
 {
-  "builds": [
-    { "src": "api/index.py", "use": "@vercel/python" },
-    {
-      "src": "api/pdf.js",
-      "use": "@vercel/node",
-      "config": { "includeFiles": "node_modules/@sparticuz/chromium/**" }
+  "functions": {
+    "api/index.py": {
+      "runtime": "@vercel/python",
+      "memory": 512,
+      "maxDuration": 30
+    },
+    "api/pdf.js": {
+      "runtime": "@vercel/node",
+      "memory": 1024,
+      "maxDuration": 60,
+      "includeFiles": "node_modules/@sparticuz/chromium/**"
     }
-  ],
+  },
   "routes": [
     { "src": "/api/pdf", "dest": "api/pdf.js" },
     { "src": "/(.*)", "dest": "api/index.py" }
-  ],
-  "functions": {
-    "api/pdf.js": { "memory": 1024, "maxDuration": 60 },
-    "api/index.py": { "memory": 512, "maxDuration": 30 }
-  }
+  ]
 }
