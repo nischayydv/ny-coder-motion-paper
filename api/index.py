@@ -1100,7 +1100,9 @@ window.MathJax = {
             .legend .swatch{ width:9mm; height:4.5mm; border:1pt solid #1b8a3e; background:#dcf2e3; border-radius:1mm; }
             .subject{ font-size:12pt; font-weight:700; text-transform:uppercase; letter-spacing:1px;
                       background:#efefef; border-left:1.6mm solid #111; padding:1.6mm 3.5mm;
-                      margin:6mm 0 4mm 0; break-after:avoid; page-break-after:avoid; }
+                      margin:6mm 0 4mm 0; break-after:avoid; page-break-after:avoid;
+                      break-before:page; page-break-before:always; }
+            .subject.first{ break-before:auto; page-break-before:auto; margin-top:2mm; }
             .q{ break-inside:avoid; page-break-inside:avoid; margin:0 0 5.5mm 0; padding-bottom:4mm; border-bottom:0.5pt solid #e2e2e2; }
             .q-head{ margin-bottom:1.2mm; break-after:avoid; }
             .q-num{ font-weight:700; font-size:11.5pt; margin-right:2.5mm; }
@@ -1225,7 +1227,7 @@ window.MathJax = {
             let lastSubject = null;
             numbered.forEach(function(item) {
                 if (item.subject !== lastSubject) {
-                    html += `<div class="subject ui">${escapeHtml(item.subject)}</div>`;
+                    html += `<div class="subject ui${lastSubject === null ? ' first' : ''}">${escapeHtml(item.subject)}</div>`;
                     lastSubject = item.subject;
                 }
                 const record = item.record;
