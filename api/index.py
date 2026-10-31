@@ -3,22 +3,37 @@
 NY CODER :: Question Viewer — Vercel serverless entrypoint.
 Flask app exposed as `app`; Vercel's @vercel/python runtime auto-detects
 and serves any WSGI-compatible `app` object from api/index.py.
+
+Local dev:  vercel dev
+Deploy:     vercel --prod
 """
 
-from flask import Flask, request, jsonify, render_template_string
-import requests
 import concurrent.futures
+import html
+import os
+import re
+import time
+
+import requests
+from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
 
 # ---------- Configuration ----------
 EXTERNAL_API = "https://learning.motion.ac.in/motioneducation/api/getsinglequestion"
 SOLUTION_API = "https://learning.motion.ac.in/motioneducation/api/getviewsolution"
-DEFAULT_PAPER_ID = 46921
+DEFAULT_PAPER_ID = int(os.environ.get("NYCODER_DEFAULT_PAPER_ID", "46921"))
 SUBJECTS = ["Maths", "Physics", "Chemistry"]
 PLANNER_TEST_ID = 0
-USER_ID = "833031"
+# Override in Vercel > Project > Settings > Environment Variables.
+USER_ID = os.environ.get("NYCODER_USER_ID", "833031")
 
+UPSTREAM_TIMEOUT = 15
+UPSTREAM_RETRIES = 2          # extra attempts on network errors / 429 / 5xx
+MAX_PAGES_PER_SUBJECT = 200   # safety valve against a bad `last_page`
+
+# Sent on every upstream call so requests look like they come from a real
+# browser session on the site itself.
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -29,41 +44,98 @@ REQUEST_HEADERS = {
     "Origin": "https://learning.motion.ac.in",
 }
 
+_DIGITS = re.compile(r"^\d{1,12}$")
+_USER = re.compile(r"^[A-Za-z0-9_\-]{1,40}$")
+
+
+def _arg_int(name, default):
+    """Digits-only query arg (paper_id / page / qid ...). Falls back to default."""
+    v = request.args.get(name, default)
+    v = str(v).strip()
+    return v if _DIGITS.match(v) else str(default)
+
+
+def _arg_user():
+    v = (request.args.get("user_id") or USER_ID).strip()
+    return v if _USER.match(v) else str(USER_ID)
+
+
+def _arg_subject():
+    v = request.args.get("subject", SUBJECTS[0])
+    return v if v in SUBJECTS else SUBJECTS[0]
+
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    return resp
+
+
+def _cached_json(payload, seconds=300):
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = f"public, s-maxage={seconds}, stale-while-revalidate=3600"
+    return resp
+
 
 def upstream_get(url, params):
-    try:
-        resp = requests.get(url, params=params, headers=REQUEST_HEADERS, timeout=15)
-    except requests.exceptions.RequestException as e:
-        return False, {"status": 502, "error": f"Network error reaching upstream: {e}"}, 502
+    """
+    GET an upstream endpoint and return (ok, payload, http_status).
 
-    try:
-        payload = resp.json()
-    except ValueError:
-        snippet = resp.text[:300].replace("\n", " ").strip()
-        reported_status = resp.status_code if resp.status_code >= 400 else 502
-        return False, {
-            "status": reported_status,
-            "error": f"Upstream returned a non-JSON response (HTTP {resp.status_code}): {snippet or '(empty body)'}",
-        }, reported_status
+    Retries network errors, 429 and 5xx with backoff. Always tries to read a
+    body, and reports non-JSON bodies (WAF/CDN challenge pages) distinctly.
+    """
+    last = (False, {"status": 502, "error": "Upstream unreachable"}, 502)
+    for attempt in range(UPSTREAM_RETRIES + 1):
+        if attempt:
+            time.sleep(0.6 * attempt)
+        try:
+            resp = requests.get(url, params=params, headers=REQUEST_HEADERS, timeout=UPSTREAM_TIMEOUT)
+        except requests.exceptions.RequestException as e:
+            last = (False, {"status": 502, "error": f"Network error reaching upstream: {e}"}, 502)
+            continue
 
-    if resp.status_code >= 400:
-        upstream_msg = None
-        if isinstance(payload, dict):
-            upstream_msg = payload.get("message") or payload.get("error")
-        return False, {
-            "status": resp.status_code,
-            "error": upstream_msg or f"Upstream HTTP {resp.status_code}",
-        }, resp.status_code
+        try:
+            payload = resp.json()
+        except ValueError:
+            snippet = resp.text[:300].replace("\n", " ").strip()
+            status = resp.status_code if resp.status_code >= 400 else 502
+            last = (False, {
+                "status": status,
+                "error": f"Upstream returned a non-JSON response (HTTP {resp.status_code}): {snippet or '(empty body)'}",
+            }, status)
+            if status == 429 or status >= 500:
+                continue
+            return last
 
-    return True, payload, resp.status_code
+        if resp.status_code >= 400:
+            msg = None
+            if isinstance(payload, dict):
+                msg = payload.get("message") or payload.get("error")
+            last = (False, {"status": resp.status_code, "error": msg or f"Upstream HTTP {resp.status_code}"}, resp.status_code)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                continue
+            return last
+
+        if not isinstance(payload, dict):
+            return False, {"status": 502, "error": "Upstream returned an unexpected payload shape"}, 502
+        return True, payload, resp.status_code
+    return last
 
 
+# ---------- Helper: fetch all pages for one subject ----------
 def fetch_all_pages_for_subject(paper_id, subject, user_id):
+    """
+    Returns every question for the subject. If a later page fails, the
+    questions already fetched are still returned together with an `error`,
+    so the client can tell a *partial* subject from an empty one.
+    """
     all_questions = []
     page = 1
     total_pages = None
 
-    while True:
+    while page <= MAX_PAGES_PER_SUBJECT:
         params = {
             "subject": subject,
             "paper_id": paper_id,
@@ -75,21 +147,26 @@ def fetch_all_pages_for_subject(paper_id, subject, user_id):
         if not ok:
             return {
                 "subject": subject,
-                "questions": [],
-                "count": 0,
-                "error": data.get("error", "Unknown upstream error"),
+                "questions": all_questions,
+                "count": len(all_questions),
+                "total_pages": total_pages,
+                "error": f"page {page}: {data.get('error', 'Unknown upstream error')}",
             }
 
-        questions_data = data.get("questions", {})
-        items = questions_data.get("data", [])
+        questions_data = data.get("questions") or {}
+        if not isinstance(questions_data, dict):
+            questions_data = {}
+        items = questions_data.get("data") or []
         all_questions.extend(items)
 
         if total_pages is None:
-            total_pages = questions_data.get("last_page", 1)
+            try:
+                total_pages = int(questions_data.get("last_page", 1) or 1)
+            except (TypeError, ValueError):
+                total_pages = 1
 
         if page >= total_pages:
             break
-
         page += 1
 
     return {
@@ -100,57 +177,47 @@ def fetch_all_pages_for_subject(paper_id, subject, user_id):
     }
 
 
+# ---------- Proxy endpoint for single question ----------
 @app.route("/api")
 def proxy_api():
-    paper_id = request.args.get("paper_id", DEFAULT_PAPER_ID)
-    page = request.args.get("page", 1)
-    subject = request.args.get("subject", SUBJECTS[0])
-    planner_test_id = request.args.get("planner_test_id", PLANNER_TEST_ID)
-    user_id = request.args.get("user_id", USER_ID)
-
     params = {
-        "subject": subject,
-        "paper_id": paper_id,
-        "planner_test_id": planner_test_id,
-        "user_id": user_id,
-        "page": page,
+        "subject": _arg_subject(),
+        "paper_id": _arg_int("paper_id", DEFAULT_PAPER_ID),
+        "planner_test_id": _arg_int("planner_test_id", PLANNER_TEST_ID),
+        "user_id": _arg_user(),
+        "page": _arg_int("page", 1),
     }
-
     ok, payload, status = upstream_get(EXTERNAL_API, params)
     if not ok:
         return jsonify(payload), status
-    return jsonify(payload)
+    return _cached_json(payload)
 
 
+# ---------- Proxy endpoint for a question's solution ----------
 @app.route("/api/solution")
 def solution_api():
-    qid = request.args.get("qid")
-    if not qid:
-        return jsonify({"status": 400, "error": "qid is required"}), 400
-
-    subject = request.args.get("subject", SUBJECTS[0])
-    paper_id = request.args.get("paper_id", DEFAULT_PAPER_ID)
-    planner_test_id = request.args.get("planner_test_id", PLANNER_TEST_ID)
-    user_id = request.args.get("user_id", USER_ID)
+    qid = request.args.get("qid", "").strip()
+    if not _DIGITS.match(qid):
+        return jsonify({"status": 400, "error": "qid is required and must be numeric"}), 400
 
     params = {
-        "subject": subject,
-        "paper_id": paper_id,
-        "planner_test_id": planner_test_id,
-        "user_id": user_id,
+        "subject": _arg_subject(),
+        "paper_id": _arg_int("paper_id", DEFAULT_PAPER_ID),
+        "planner_test_id": _arg_int("planner_test_id", PLANNER_TEST_ID),
+        "user_id": _arg_user(),
         "qid": qid,
     }
-
     ok, payload, status = upstream_get(SOLUTION_API, params)
     if not ok:
         return jsonify(payload), status
-    return jsonify(payload)
+    return _cached_json(payload)
 
 
+# ---------- Full paper (all subjects, all pages) ----------
 @app.route("/api/full_paper")
 def full_paper_api():
-    paper_id = request.args.get("paper_id", DEFAULT_PAPER_ID)
-    user_id = request.args.get("user_id", USER_ID)
+    paper_id = _arg_int("paper_id", DEFAULT_PAPER_ID)
+    user_id = _arg_user()
 
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
@@ -162,24 +229,18 @@ def full_paper_api():
             subject = future_to_subject[future]
             try:
                 results[subject] = future.result()
-            except Exception as e:
-                results[subject] = {
-                    "subject": subject,
-                    "questions": [],
-                    "count": 0,
-                    "error": str(e),
-                }
+            except Exception as e:  # noqa: BLE001 - never let one subject kill the response
+                results[subject] = {"subject": subject, "questions": [], "count": 0, "error": str(e)}
 
-    return jsonify(
-        {
-            "status": 200,
-            "paper_id": paper_id,
-            "subjects": results,
-        }
-    )
+    has_error = any(r.get("error") for r in results.values())
+    resp = jsonify({"status": 200, "paper_id": paper_id, "subjects": results})
+    # Never cache a response that contains a failure.
+    resp.headers["Cache-Control"] = "no-store" if has_error else "public, s-maxage=300, stale-while-revalidate=3600"
+    return resp
 
 
-HTML_TEMPLATE = """
+# ---------- HTML page (embedded, NY CODER theme) ----------
+HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -405,14 +466,11 @@ HTML_TEMPLATE = """
     }
     .opt-box .opt-letter{ color:var(--green-dim); font-weight:700; min-width:18px; }
     .opt-box.correct{
-        border-color: var(--green); background: rgba(0,255,65,0.14);
-        box-shadow: var(--green-glow); font-weight: 600;
+        border-color: var(--green); background: rgba(0,255,65,0.1);
+        box-shadow: var(--green-glow);
     }
     .opt-box.correct .opt-letter{ color:var(--green); }
-    .opt-box.correct::after{
-        content:"✔ CORRECT"; margin-left:auto; font-size:0.7em;
-        color:var(--green); letter-spacing:1px; white-space:nowrap;
-    }
+    .opt-box.correct::after{ content:"✔ CORRECT"; margin-left:auto; font-size:0.7em; color:var(--green); letter-spacing:1px; }
 
     .sol-heading{
         color:var(--amber); text-transform:uppercase; letter-spacing:2px; font-size:0.85em;
@@ -436,81 +494,15 @@ HTML_TEMPLATE = """
     ::-webkit-scrollbar-thumb{ background: var(--border); border-radius:5px; }
     ::-webkit-scrollbar-thumb:hover{ background: var(--green-dim); }
 
-    /* ---------- Print-only exam-paper layout ---------- */
-    .print-only{ display:none; }
-
-    @media print {
-        @page { margin: 18mm 16mm; }
-        html, body{ height:auto; }
-        body *{ visibility:hidden; }
-        #matrixCanvas, .scanlines, .crt-flicker{ display:none !important; }
-        #printContainer, #printContainer *{ visibility:visible; }
-        #printContainer{
-            display:block; position:absolute; inset:0; margin:0; padding:0;
-            background:#ffffff; color:#1a1a1a;
-            font-family: Georgia, 'Times New Roman', serif;
-        }
-        .pdf-header{
-            display:flex; justify-content:space-between; align-items:flex-end;
-            border-bottom:3px solid #1a1a1a; padding-bottom:10px; margin-bottom:18px;
-        }
-        .pdf-header .pdf-brand{ font-size:1.5em; font-weight:700; letter-spacing:2px; font-family: 'Courier New', monospace; }
-        .pdf-header .pdf-brand span{ color:#c0392b; }
-        .pdf-header .pdf-meta{ text-align:right; font-size:0.85em; color:#444; font-family: Arial, sans-serif; line-height:1.5; }
-
-        .pdf-subject-title{
-            font-family: Arial, sans-serif; font-size:1.15em; font-weight:700; text-transform:uppercase;
-            letter-spacing:1px; background:#f0f0f0; padding:6px 12px; margin:22px 0 12px 0;
-            border-left:4px solid #1a1a1a;
-        }
-        .pdf-question{ margin-bottom:18px; page-break-inside: avoid; }
-        .pdf-question .pdf-qnum{ font-weight:700; font-size:1.02em; }
-        .pdf-question .pdf-qtag{
-            font-family: Arial, sans-serif; font-size:0.7em; color:#666; border:1px solid #999;
-            border-radius:10px; padding:1px 8px; margin-left:8px; text-transform:uppercase;
-        }
-        .pdf-question .pdf-qtext{ margin:6px 0 10px 0; line-height:1.5; }
-        .pdf-question .pdf-qtext p{ margin:0.4em 0; }
-        .pdf-question img{ max-width:100%; height:auto; min-height: 20px; }
-
-        .pdf-opts{ display:grid; grid-template-columns: 1fr 1fr; gap:6px 18px; margin-left:6px; }
-        .pdf-opt{
-            font-family: Arial, sans-serif; font-size:0.95em; display:flex; gap:6px;
-            align-items:flex-start; padding:2px 6px; border-radius:3px;
-        }
-        .pdf-opt .pdf-opt-letter{ font-weight:700; min-width:16px; }
-        .pdf-opt img{ max-width:100%; height:auto; min-height: 20px; }
-
-        .pdf-opt.pdf-correct{
-            font-weight:700; background:#e8f7ec; border:1px solid #1e8a3c; color:#0f4d1f;
-        }
-        .pdf-opt.pdf-correct .pdf-opt-letter::after{ content:" \\2713"; color:#1e8a3c; }
-
-        .pdf-opt-unavailable{
-            font-family: Arial, sans-serif; font-size:0.8em; color:#888;
-            font-style:italic; margin-left:6px;
-        }
-
-        .pdf-answer-key{ margin-top:30px; page-break-before: always; }
-        .pdf-answer-key h2{
-            font-family: Arial, sans-serif; font-size:1.2em; text-transform:uppercase; letter-spacing:1px;
-            border-bottom:2px solid #1a1a1a; padding-bottom:6px; margin-bottom:14px;
-        }
-        .pdf-key-grid{
-            display:grid; grid-template-columns: repeat(6, 1fr); gap:8px 4px;
-            font-family: Arial, sans-serif; font-size:0.9em;
-        }
-        .pdf-key-cell{ border:1px solid #ccc; border-radius:4px; padding:4px 6px; text-align:center; }
-        .pdf-key-cell b{ color:#c0392b; }
-        .pdf-key-subject-label{
-            grid-column: 1 / -1; font-weight:700; font-size:0.85em; text-transform:uppercase;
-            color:#444; margin-top:8px;
-        }
-        .pdf-footer{
-            margin-top:20px; padding-top:8px; border-top:1px solid #ccc;
-            font-family: Arial, sans-serif; font-size:0.7em; color:#999; text-align:center;
-        }
+    /* Fill-in-the-blank marker (used on screen AND in the exported PDF) */
+    .blank{
+        display:inline-block; min-width:4em; border-bottom:2px solid currentColor;
+        text-decoration:none; line-height:1.1; margin:0 0.2em; vertical-align:baseline;
     }
+    .q-text img, .sol-text img, .opt-box img{ max-width:100%; height:auto; }
+
+    /* Hidden staging area used while building the PDF */
+    .print-only{ display:none; }
 </style>
 </head>
 <body>
@@ -521,6 +513,7 @@ HTML_TEMPLATE = """
 
 <div class="wrap">
   <div class="container">
+
     <div class="titlebar">
         <span class="dot red"></span>
         <span class="dot amber"></span>
@@ -530,6 +523,7 @@ HTML_TEMPLATE = """
     </div>
 
     <div class="content">
+
         <div class="brand">
             <h1 class="glitch" data-text="NY CODER">NY CODER</h1>
             <div class="subtitle">[ OSINT MODULE :: QUESTION EXTRACTION TERMINAL v2.7 ]</div>
@@ -541,9 +535,9 @@ HTML_TEMPLATE = """
 
         <div class="controls">
             <label for="paperId">Target Paper_ID ::</label>
-            <input type="number" id="paperId" value="{{ default_paper }}" min="1">
+            <input type="number" id="paperId" value="__DEFAULT_PAPER__" min="1">
             <label for="userId">User_ID ::</label>
-            <input type="text" id="userId" value="{{ default_user_id }}" placeholder="0000">
+            <input type="text" id="userId" value="__DEFAULT_USER_ID__" placeholder="0000">
             <button id="goBtn">&gt; Execute</button>
             <button id="resetBtn" class="secondary">&gt; Reset</button>
             <button id="pdfBtn" class="pdf-btn">&gt; Download PDF</button>
@@ -554,10 +548,14 @@ HTML_TEMPLATE = """
                 <label><input type="radio" name="mode" value="full"> Full Dump</label>
             </div>
         </div>
+        <div class="subtitle" style="text-align:left; margin: -12px 0 16px 0;">
+            Tip: solutions/attempt-status are looked up per user on the upstream API — if <b>View Solution</b> errors out, try setting User_ID to your real account id instead of the default placeholder.
+        </div>
 
         <div id="status" class="status"></div>
         <div id="pdfStatus" class="status hidden"></div>
 
+        <!-- Single-question view -->
         <div id="singleView">
             <div class="question-box">
                 <div class="qid" id="qidDisplay">QID: —</div>
@@ -573,6 +571,7 @@ HTML_TEMPLATE = """
             <div class="page-info" id="pageInfo">Page 0 / 0</div>
         </div>
 
+        <!-- Full-paper view -->
         <div id="fullView" class="hidden">
             <div id="fullContent"></div>
         </div>
@@ -580,15 +579,29 @@ HTML_TEMPLATE = """
         <div class="footer-tag">
             <b>ACCESS GRANTED</b> :: Trace me if you can. || NY CODER © all rights reversed.
         </div>
+
     </div>
   </div>
 </div>
 
+<!-- Print-only, professionally formatted PDF/exam-paper layout.
+     Hidden on screen; @media print swaps visibility so this is the only
+     thing that ends up in the generated PDF when the user hits Download PDF. -->
 <div id="printContainer" class="print-only"></div>
 
 <script>
 window.MathJax = {
-    tex: { inlineMath: [['$', '$'], ['\\\\(', '\\\\)']] },
+    loader: { load: ['[tex]/noerrors', '[tex]/noundefined'] },
+    tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']],
+        packages: { '[+]': ['noerrors', 'noundefined'] },
+        macros: {
+            hspace: ['\\kern #1', 1],   // MathJax has no \hspace; map it so blanks keep their width
+            vspace: ['', 1]
+        }
+    },
+    noundefined: { color: 'inherit', background: '', size: '' },
     chtml: { fontURL: 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/output/chtml/fonts/woff-v2' }
 };
 </script>
@@ -644,25 +657,29 @@ window.MathJax = {
         const pdfBtn = document.getElementById('pdfBtn');
         const pdfStatus = document.getElementById('pdfStatus');
         const printContainer = document.getElementById('printContainer');
+
         const singleView = document.getElementById('singleView');
         const fullView = document.getElementById('fullView');
         const fullContent = document.getElementById('fullContent');
+
         const modeRadios = document.querySelectorAll('input[name="mode"]');
 
         let currentPage = 1;
         let totalPages = 0;
-        let paperId = parseInt(paperInput.value) || {{ default_paper }};
+        let paperId = parseInt(paperInput.value) || __DEFAULT_PAPER__;
         let isLoading = false;
         let currentMode = 'single';
-        let currentSingleQuestion = null;
-        let lastFullPaperData = null;
+        let currentSingleQuestion = null; // { qid, subject, toughness, q_text } for the on-screen single question
+        let lastFullPaperData = null;      // last successful /api/full_paper response, for PDF export
 
         function switchMode(mode) {
             currentMode = mode;
             if (mode === 'single') {
                 singleView.classList.remove('hidden');
                 fullView.classList.add('hidden');
-                if (paperId > 0) fetchQuestion(currentPage);
+                if (paperId > 0) {
+                    fetchQuestion(currentPage);
+                }
             } else {
                 singleView.classList.add('hidden');
                 fullView.classList.remove('hidden');
@@ -672,7 +689,9 @@ window.MathJax = {
 
         modeRadios.forEach(radio => {
             radio.addEventListener('change', function() {
-                if (this.checked) switchMode(this.value);
+                if (this.checked) {
+                    switchMode(this.value);
+                }
             });
         });
 
@@ -680,71 +699,168 @@ window.MathJax = {
             return (userIdInput.value || '').trim() || '0000';
         }
 
-        // Bulletproof URL fixer and lazy-load handler
+        // ---------- Upstream HTML cleaning ----------
+        // The upstream API returns question/option/solution text as full,
+        // standalone "<html>...<body>..." strings. Before any of it is shown
+        // or exported we:
+        //   1. parse each fragment in isolation (no cross-contamination),
+        //   2. strip scripts/styles/classes/ids/event handlers (security, and
+        //      so upstream CSS can never hide or restyle our own page),
+        //   3. strip inline styles that make text invisible or unprintable
+        //      (white text, visibility:hidden, opacity, absolute positioning),
+        //   4. make relative image URLs absolute,
+        //   5. turn every kind of "blank" into a visible .blank marker.
+        const SITE_ORIGIN = 'https://learning.motion.ac.in';
+        const MATH_SPLIT_RE = /(\$\$[\s\S]*?\$\$|\$(?:\\.|[^$\\])+\$|\\\([\s\S]*?\\\)|\\\[[\s\S]*?\\\])/g;
+        const STYLE_DROP = ['color', 'background', 'background-color', 'background-image', 'visibility',
+            'opacity', 'position', 'top', 'left', 'right', 'bottom', 'z-index', 'overflow', 'overflow-x',
+            'overflow-y', 'clip', 'clip-path', 'font-family', 'font-size', 'line-height', 'transform',
+            'filter', 'text-shadow', '-webkit-text-fill-color', 'text-indent', 'letter-spacing', 'height',
+            'max-height', 'min-height'];
+
+        function makeBlank(len) {
+            const span = document.createElement('span');
+            span.className = 'blank';
+            span.style.minWidth = Math.min(Math.max(len * 0.45, 3), 10).toFixed(1) + 'em';
+            span.textContent = '\u00A0';
+            return span;
+        }
+
+        // MathJax has no \hspace / empty \underline{}; both are typical blank encodings.
+        function fixMathSource(tex) {
+            return tex
+                .replace(/\\hspace\*?\s*\{\s*([^{}]*?)\s*\}/g, function(m, dim) {
+                    dim = dim.replace(/\s+/g, '');
+                    return /^-?[\d.]+(em|ex|mu|px|mm|cm|in|pt|pc)$/i.test(dim) ? '\\kern ' + dim + ' ' : '\\kern 3em ';
+                })
+                .replace(/\\vspace\*?\s*\{[^{}]*\}/g, '')
+                .replace(/\\underline\s*\{\s*\}/g, '\\underline{\\kern 3em}')
+                .replace(/^\$\s*\$$|^\\\(\s*\\\)$/, '');   // math that became empty -> drop it
+        }
+
+        function isEmptyText(el) {
+            return el.textContent.replace(/[\s\u00A0\u200B]/g, '') === '' &&
+                !el.querySelector('img, svg, mjx-container, table');
+        }
+
+        function normalizeFragmentDom(root) {
+            // 1. remove dangerous / page-affecting elements
+            root.querySelectorAll('script, style, link, meta, iframe, object, embed, form, base, noscript, title, template')
+                .forEach(function(n) { n.remove(); });
+
+            // 2. inputs become blanks
+            root.querySelectorAll('input, textarea, select').forEach(function(el) {
+                const t = (el.getAttribute('type') || 'text').toLowerCase();
+                if (['radio', 'checkbox', 'hidden', 'button', 'submit'].indexOf(t) >= 0) { el.remove(); return; }
+                const len = parseInt(el.getAttribute('size') || el.getAttribute('maxlength') || '8', 10) || 8;
+                el.replaceWith(makeBlank(len));
+            });
+
+            // 3. attribute / style cleaning
+            root.querySelectorAll('*').forEach(function(el) {
+                Array.from(el.attributes).forEach(function(a) {
+                    const n = a.name.toLowerCase();
+                    if (n.indexOf('on') === 0 || ['srcdoc', 'formaction', 'color', 'face', 'bgcolor', 'background',
+                        'id', 'contenteditable', 'autofocus', 'srcset', 'crossorigin', 'loading'].indexOf(n) >= 0) {
+                        el.removeAttribute(a.name);
+                    }
+                });
+                // keep only our own "blank" class
+                const keepBlank = el.classList.contains('blank');
+                el.removeAttribute('class');
+                if (keepBlank) el.classList.add('blank');
+
+                if (el.hasAttribute('style')) {
+                    const isImg = el.tagName === 'IMG';
+                    STYLE_DROP.forEach(function(p) {
+                        if (isImg && (p === 'height' || p === 'max-height' || p === 'min-height')) return;
+                        el.style.removeProperty(p);
+                    });
+                    if (!el.getAttribute('style').trim()) el.removeAttribute('style');
+                }
+            });
+
+            // 4. images: absolute URLs, safe schemes only
+            root.querySelectorAll('img').forEach(function(img) {
+                const src = img.getAttribute('src');
+                if (!src) { img.remove(); return; }
+                try {
+                    const u = new URL(src.trim(), SITE_ORIGIN + '/');
+                    if (u.protocol === 'http:' || u.protocol === 'https:' || u.protocol === 'data:') {
+                        img.setAttribute('src', u.protocol === 'data:' ? src.trim() : u.href);
+                    } else { img.remove(); }
+                } catch (e) { img.remove(); }
+                if (img.isConnected) img.setAttribute('loading', 'eager');
+            });
+
+            // 5. links: unwrap (neither useful nor safe in a printed paper)
+            root.querySelectorAll('a').forEach(function(a) {
+                const s = document.createElement('span');
+                while (a.firstChild) s.appendChild(a.firstChild);
+                a.replaceWith(s);
+            });
+
+            // 6. empty underlined / bordered elements are blanks
+            root.querySelectorAll('u, ins, [style*="underline"], [style*="border-bottom"]').forEach(function(el) {
+                if (el.classList.contains('blank')) return;
+                if (el.tagName === 'TABLE' || el.tagName === 'TD' || el.tagName === 'TR' || el.tagName === 'TH') return;
+                if (!isEmptyText(el)) return;
+                const len = el.textContent.length || 6;
+                const b = makeBlank(len);
+                el.replaceWith(b);
+            });
+
+            // 7. text nodes: underscore runs -> blanks, math source repaired
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+            const textNodes = [];
+            while (walker.nextNode()) textNodes.push(walker.currentNode);
+            textNodes.forEach(function(node) {
+                const text = node.nodeValue;
+                if (!text || (text.indexOf('_') < 0 && text.indexOf('\\') < 0)) return;
+                let changed = false;
+                const frag = document.createDocumentFragment();
+                text.split(MATH_SPLIT_RE).forEach(function(part, idx) {
+                    if (!part) return;
+                    if (idx % 2 === 1) {
+                        const fixed = fixMathSource(part);
+                        if (fixed !== part) changed = true;
+                        frag.appendChild(document.createTextNode(fixed));
+                        return;
+                    }
+                    part.split(/(_{2,})/).forEach(function(p, j) {
+                        if (!p) return;
+                        if (j % 2 === 1) { changed = true; frag.appendChild(makeBlank(p.length)); }
+                        else frag.appendChild(document.createTextNode(p));
+                    });
+                });
+                if (changed) node.parentNode.replaceChild(frag, node);
+            });
+        }
+
         function extractFragmentHtml(raw) {
             if (!raw) return '';
             try {
-                const doc = new DOMParser().parseFromString(raw, 'text/html');
-                const body = doc.body || doc.documentElement;
-                if (!body) return raw;
-
-                // 1. Handle lazy-loaded images
-                body.querySelectorAll('img').forEach(el => {
-                    if (!el.getAttribute('src')) {
-                        const lazySrc = el.getAttribute('data-src') || el.getAttribute('data-original') || el.getAttribute('data-lazy-src');
-                        if (lazySrc) el.setAttribute('src', lazySrc);
-                    }
-                });
-
-                // 2. Fix all URLs
-                body.querySelectorAll('img[src], source[src], a[href]').forEach(el => {
-                    ['src', 'href'].forEach(attr => {
-                        const v = el.getAttribute(attr);
-                        if (!v) return;
-                        
-                        if (/^(data:|blob:|mailto:|#)/i.test(v)) return;
-                        if (v.startsWith('//')) {
-                            el.setAttribute(attr, 'https:' + v);
-                            return;
-                        }
-                        if (/^https?:/i.test(v)) {
-                            if (v.startsWith('http://')) el.setAttribute(attr, v.replace('http://', 'https://'));
-                            return;
-                        }
-                        
-                        let absoluteUrl;
-                        if (v.startsWith('/')) {
-                            absoluteUrl = 'https://learning.motion.ac.in' + v;
-                        } else {
-                            absoluteUrl = 'https://learning.motion.ac.in/motioneducation/' + v;
-                        }
-                        el.setAttribute(attr, absoluteUrl);
-                    });
-                    
-                    const srcset = el.getAttribute('srcset');
-                    if (srcset) {
-                        el.setAttribute('srcset', srcset.split(',').map(part => {
-                            const bits = part.trim().split(/\s+/);
-                            let u = bits[0];
-                            if (!/^(data:|blob:|\/\/)/i.test(u)) {
-                                if (/^http:/i.test(u)) {
-                                    u = u.replace('http://', 'https://');
-                                } else if (!/^https:/i.test(u)) {
-                                    u = u.startsWith('/') ? 'https://learning.motion.ac.in' + u : 'https://learning.motion.ac.in/motioneducation/' + u;
-                                }
-                            } else if (u.startsWith('//')) {
-                                u = 'https:' + u;
-                            }
-                            return [u, ...bits.slice(1)].join(' ');
-                        }).join(', '));
-                    }
-                });
-                return body.innerHTML;
+                const doc = new DOMParser().parseFromString(String(raw), 'text/html');
+                if (!doc.body) return '';
+                normalizeFragmentDom(doc.body);
+                return doc.body.innerHTML;
             } catch (e) {
-                return raw;
+                console.warn('extractFragmentHtml failed:', e);
+                const d = document.createElement('div');
+                d.textContent = String(raw);   // never inject raw upstream HTML on failure
+                return d.innerHTML;
             }
         }
 
+        function isCorrectOpt(opt) {
+            if (!opt) return false;
+            const v = opt.is_correct;
+            return v === true || v === 1 || String(v).trim() === '1' || String(v).trim().toLowerCase() === 'true';
+        }
+
+        // Fetches a URL and always returns the parsed JSON body — even on a
+        // non-2xx response — so upstream error text (surfaced by our own
+        // /api* routes) makes it to the UI instead of a bare "HTTP 500".
         async function fetchJSON(url) {
             let response;
             try {
@@ -752,12 +868,14 @@ window.MathJax = {
             } catch (networkErr) {
                 throw new Error(`Network error: ${networkErr.message}`);
             }
+
             let data = null;
             try {
                 data = await response.json();
             } catch (parseErr) {
                 throw new Error(`Bad response (HTTP ${response.status}): could not parse JSON`);
             }
+
             if (!response.ok || data.status !== 200) {
                 throw new Error(data.error || data.message || `HTTP ${response.status}`);
             }
@@ -772,7 +890,11 @@ window.MathJax = {
 
             try {
                 const params = new URLSearchParams({
-                    paper_id: paperId, page: page, subject: 'Maths', planner_test_id: 0, user_id: currentUserId()
+                    paper_id: paperId,
+                    page: page,
+                    subject: 'Maths',
+                    planner_test_id: 0,
+                    user_id: currentUserId()
                 });
                 const data = await fetchJSON(`/api?${params.toString()}`);
                 renderSingle(data);
@@ -781,7 +903,8 @@ window.MathJax = {
             } catch (err) {
                 statusDiv.textContent = `Error: ${err.message}`;
                 statusDiv.className = 'status error';
-                prevBtn.disabled = true; nextBtn.disabled = true;
+                prevBtn.disabled = true;
+                nextBtn.disabled = true;
                 pageInfo.textContent = 'Page 0 / 0';
                 qidDisplay.textContent = 'QID: —';
                 toughnessDisplay.textContent = '—';
@@ -798,7 +921,8 @@ window.MathJax = {
                 toughnessDisplay.textContent = '—';
                 qTextDisplay.innerHTML = 'No question data.';
                 pageInfo.textContent = 'Page 0 / 0';
-                prevBtn.disabled = true; nextBtn.disabled = true;
+                prevBtn.disabled = true;
+                nextBtn.disabled = true;
                 singleSolBtn.classList.add('hidden');
                 singleSolPanel.classList.add('hidden');
                 currentSingleQuestion = null;
@@ -829,9 +953,14 @@ window.MathJax = {
             const cleanQText = extractFragmentHtml(q.q_text) || '(empty)';
             qTextDisplay.innerHTML = cleanQText;
             currentSingleQuestion = {
-                qid: q.qid, subject: q.subject || 'Maths', toughness: q.toughness || '—', q_text: cleanQText
+                qid: q.qid,
+                subject: q.subject || 'Maths',
+                toughness: q.toughness || '—',
+                q_text: cleanQText
             };
 
+            // Wire up the solution button for this question, resetting any
+            // previously-open panel from the last question viewed.
             singleSolBtn.dataset.qid = q.qid;
             singleSolBtn.dataset.subject = q.subject || 'Maths';
             singleSolBtn.textContent = '> View Solution';
@@ -844,42 +973,43 @@ window.MathJax = {
             }
         }
 
-        const solutionCache = {};
+        // ---------- Solution feature (shared by single view, full view, and PDF export) ----------
+        const solutionCache = {}; // qid -> parsed solution record | { __error: message }
 
-        function optionLetter(i) { return String.fromCharCode(65 + i); }
-
-        function normaliseOptions(record) {
-            if (!record || record.__error) return [];
-            const raw = record.option || record.options || [];
-            if (!Array.isArray(raw)) return [];
-            return raw.map((o) => {
-                if (o == null) return { text: '', correct: false };
-                let text = '';
-                if (typeof o === 'string') text = o;
-                else if (typeof o === 'object') {
-                    text = o.option ?? o.text ?? o.option_text ?? o.value ?? '';
-                    if (text && typeof text === 'object') text = text.html ?? text.text ?? '';
-                }
-                const correct = Number(o && o.is_correct) === 1 || String(o && o.is_correct) === '1' || o && o.is_correct === true || o && o.correct === true || Number(o && o.correct) === 1;
-                return { text: String(text || ''), correct };
-            });
+        function optionLetter(i) {
+            return String.fromCharCode(65 + i); // 0 -> A, 1 -> B, ...
         }
 
+        // Fetches (and caches) the options + correct-answer + solution record
+        // for one question. Shared by the "View Solution" panel and the PDF
+        // export, so a question the user already expanded on screen won't be
+        // re-fetched when building the PDF, and vice versa.
         async function fetchSolutionRecord(qid, subject) {
-            if (Object.prototype.hasOwnProperty.call(solutionCache, qid)) return solutionCache[qid];
-            try {
-                const params = new URLSearchParams({
-                    subject: subject || 'Maths', paper_id: paperId, planner_test_id: 0, user_id: currentUserId(), qid: qid
-                });
-                const data = await fetchJSON(`/api/solution?${params.toString()}`);
-                const record = (data.data && data.data[0]) || null;
-                solutionCache[qid] = record;
-                return record;
-            } catch (err) {
-                const errored = { __error: err.message };
-                solutionCache[qid] = errored;
-                return errored;
+            if (Object.prototype.hasOwnProperty.call(solutionCache, qid)) {
+                return solutionCache[qid];
             }
+            // Retry transient failures (rate limits, WAF hiccups, 5xx). Failures are
+            // NOT cached, so a later attempt (or a re-export) can succeed.
+            let lastErr = null;
+            for (let attempt = 0; attempt < 4; attempt++) {
+                try {
+                    const params = new URLSearchParams({
+                        subject: subject || 'Maths',
+                        paper_id: paperId,
+                        planner_test_id: 0,
+                        user_id: currentUserId(),
+                        qid: qid
+                    });
+                    const data = await fetchJSON(`/api/solution?${params.toString()}`);
+                    const record = (data.data && data.data[0]) || null;
+                    solutionCache[qid] = record;
+                    return record;
+                } catch (err) {
+                    lastErr = err;
+                    await new Promise(function(r) { setTimeout(r, 600 * (attempt + 1) * (attempt + 1)); });
+                }
+            }
+            return { __error: lastErr ? lastErr.message : 'Unknown error' };
         }
 
         function renderSolutionPanel(panelEl, record) {
@@ -891,15 +1021,15 @@ window.MathJax = {
                 panelEl.innerHTML = `<div class="sol-error">Error: ${record.__error}</div>`;
                 return;
             }
-            const opts = normaliseOptions(record);
+            const opts = record.option || [];
             let html = '';
             if (opts.length) {
                 html += '<div class="opt-grid">';
                 opts.forEach((opt, i) => {
-                    const cls = opt.correct ? ' correct' : '';
-                    html += `<div class="opt-box${cls}">
+                    const correct = isCorrectOpt(opt);
+                    html += `<div class="opt-box${correct ? ' correct' : ''}">
                         <span class="opt-letter">${optionLetter(i)}.</span>
-                        <span>${extractFragmentHtml(opt.text) || '<em>(option text unavailable)</em>'}</span>
+                        <span>${extractFragmentHtml(opt.option)}</span>
                     </div>`;
                 });
                 html += '</div>';
@@ -921,6 +1051,7 @@ window.MathJax = {
                 btnEl.classList.remove('open');
                 return;
             }
+
             panelEl.classList.remove('hidden');
             btnEl.textContent = '> Hide Solution';
             btnEl.classList.add('open');
@@ -930,22 +1061,102 @@ window.MathJax = {
                 renderSolutionPanel(panelEl, cached);
                 return;
             }
+
             panelEl.innerHTML = '<div class="sol-loading">decrypting solution payload</div>';
             const record = await fetchSolutionRecord(qid, subject);
             renderSolutionPanel(panelEl, record);
         }
 
         singleSolBtn.addEventListener('click', function() {
-            if (!this.dataset.qid) return;
-            fetchSolution(this.dataset.qid, this.dataset.subject, singleSolBtn, singleSolPanel);
+            const qid = this.dataset.qid;
+            const subject = this.dataset.subject;
+            if (!qid) return;
+            fetchSolution(qid, subject, singleSolBtn, singleSolPanel);
         });
 
+        // Event delegation for solution buttons rendered inside the full-paper view
         fullContent.addEventListener('click', function(e) {
             const btn = e.target.closest('.sol-btn');
             if (!btn) return;
-            fetchSolution(btn.dataset.qid, btn.dataset.subject, btn, btn.nextElementSibling);
+            const panel = btn.nextElementSibling;
+            fetchSolution(btn.dataset.qid, btn.dataset.subject, btn, panel);
         });
 
+        // ---------- PDF export ("Download PDF") ----------
+        const PRINT_CSS = `
+            @page { size: A4; margin: 18mm 16mm 20mm 16mm; }
+            *{ box-sizing:border-box; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+            html,body{ margin:0; padding:0; background:#fff; }
+            body{ font-family:'Source Serif 4','Noto Serif','Open Sans',Georgia,'Times New Roman',serif;
+                  font-size:11pt; line-height:1.5; color:#111; }
+            .ui{ font-family:'Inter','Noto Sans','Open Sans',Arial,Helvetica,sans-serif; }
+            p{ margin:0.35em 0; }
+            .doc-head{ display:flex; justify-content:space-between; align-items:flex-end;
+                       border-bottom:2.5pt solid #111; padding-bottom:3mm; margin-bottom:4mm; }
+            .brand{ font-family:'Courier New','DejaVu Sans Mono',monospace; font-size:20pt; font-weight:700; letter-spacing:2px; }
+            .brand span{ color:#b3261e; }
+            .meta{ text-align:right; font-size:8.5pt; line-height:1.55; color:#444; }
+            .legend{ display:flex; align-items:center; gap:2.5mm; font-size:8.5pt; color:#333; margin:0 0 4mm 0; }
+            .legend .swatch{ width:9mm; height:4.5mm; border:1pt solid #1b8a3e; background:#dcf2e3; border-radius:1mm; }
+            .subject{ font-size:12pt; font-weight:700; text-transform:uppercase; letter-spacing:1px;
+                      background:#efefef; border-left:1.6mm solid #111; padding:1.6mm 3.5mm;
+                      margin:6mm 0 4mm 0; break-after:avoid; page-break-after:avoid; }
+            .q{ break-inside:avoid; page-break-inside:avoid; margin:0 0 5.5mm 0; padding-bottom:4mm; border-bottom:0.5pt solid #e2e2e2; }
+            .q-head{ margin-bottom:1.2mm; break-after:avoid; }
+            .q-num{ font-weight:700; font-size:11.5pt; margin-right:2.5mm; }
+            .q-tag{ font-size:7pt; color:#555; border:0.6pt solid #999; border-radius:3mm; padding:0.3mm 2.4mm; text-transform:uppercase; letter-spacing:0.5px; }
+            .q-text{ margin:0 0 3mm 0; overflow-wrap:anywhere; }
+            .q-text img{ max-width:100%; max-height:95mm; height:auto; vertical-align:middle; }
+            .q-text table, .opt .body table{ border-collapse:collapse; max-width:100% !important; margin:2mm 0; }
+            .q-text td, .q-text th, .opt .body td, .opt .body th{ border:0.6pt solid #888; padding:0.8mm 2mm; }
+            .blank{ display:inline-block; min-width:4em; border-bottom:1.1pt solid #111; text-decoration:none;
+                    line-height:1.05; margin:0 0.25em; vertical-align:baseline; }
+            .opts{ display:grid; gap:2mm 3.5mm; }
+            .opts.cols-4{ grid-template-columns:repeat(4, minmax(0,1fr)); }
+            .opts.cols-2{ grid-template-columns:repeat(2, minmax(0,1fr)); }
+            .opts.cols-1{ grid-template-columns:minmax(0,1fr); }
+            .opt{ display:flex; align-items:flex-start; gap:2.2mm; padding:1.5mm 2.2mm;
+                  border:1pt solid transparent; border-radius:1.6mm; break-inside:avoid; }
+            .opt .tag{ flex:none; width:5.4mm; height:5.4mm; border:0.8pt solid #777; border-radius:50%;
+                       display:inline-flex; align-items:center; justify-content:center;
+                       font-weight:700; font-size:8.5pt; line-height:1; margin-top:0.4mm; background:#fff; }
+            .opt .body{ flex:1; min-width:0; overflow-wrap:anywhere; }
+            .opt .body p{ margin:0; }
+            .opt .body img{ max-width:100%; max-height:45mm; height:auto; }
+            .opt .muted{ color:#888; }
+            .opt .tick{ flex:none; width:4.6mm; height:4.6mm; margin-top:0.5mm; }
+            .opt.correct{ background:#dcf2e3; border:1.2pt solid #1b8a3e; }
+            .opt.correct .tag{ background:#1b8a3e; border-color:#1b8a3e; color:#fff; }
+            .opt.correct .body{ font-weight:600; }
+            .typed{ display:inline-flex; align-items:center; gap:2.5mm; padding:1.6mm 3.5mm; background:#dcf2e3;
+                    border:1.2pt solid #1b8a3e; border-radius:1.6mm; font-weight:700; font-size:10pt; }
+            .typed .lbl{ font-weight:600; font-size:8pt; text-transform:uppercase; letter-spacing:0.6px; color:#1b6f36; }
+            .note{ font-size:8.5pt; padding:1.6mm 3mm; border-radius:1.4mm; background:#fff4e5; border:0.6pt solid #e0a040; color:#7a4a00; }
+            .note.soft{ background:#f5f5f5; border-color:#ccc; color:#666; }
+            .key{ break-before:page; page-break-before:always; }
+            .key h2{ font-size:13pt; text-transform:uppercase; letter-spacing:1px; border-bottom:1.5pt solid #111; padding-bottom:2mm; margin:0 0 4mm 0; }
+            .key-sub{ font-weight:700; font-size:9pt; text-transform:uppercase; color:#444; margin:5mm 0 2mm 0; }
+            .key-grid{ display:grid; grid-template-columns:repeat(6, minmax(0,1fr)); gap:2mm; font-size:9.5pt; }
+            .key-cell{ border:0.6pt solid #c9c9c9; border-radius:1.5mm; padding:1.4mm 1.6mm; text-align:center; break-inside:avoid; }
+            .key-cell b{ color:#1b7f3b; }
+            .key-cell.miss{ background:#fff4e5; border-color:#e0a040; }
+            mjx-container[display="true"]{ margin:0.7em 0 !important; }
+        `;
+
+        const TICK_SVG = '<svg class="tick" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="8" fill="#1b8a3e"/><path d="M4.2 8.4l2.6 2.6 5-5.4" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, function(c) {
+                return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+            });
+        }
+
+        function htmlToText(html) {
+            const d = new DOMParser().parseFromString(String(html || ''), 'text/html');
+            return (d.body.textContent || '').trim();
+        }
+
+        // Runs async jobs with a concurrency cap (don't hammer the upstream API).
         async function mapWithConcurrency(items, limit, worker) {
             const results = new Array(items.length);
             let nextIndex = 0;
@@ -960,66 +1171,118 @@ window.MathJax = {
             return results;
         }
 
-        function correctLetterFor(record) {
-            const opts = normaliseOptions(record);
-            if (!opts.length) return null;
-            const idx = opts.findIndex(o => o.correct);
-            return idx >= 0 ? optionLetter(idx) : null;
+        // All correct letters (multi-correct questions have more than one).
+        function correctLettersFor(record) {
+            if (!record || record.__error || !Array.isArray(record.option)) return [];
+            const out = [];
+            record.option.forEach(function(o, i) { if (isCorrectOpt(o)) out.push(optionLetter(i)); });
+            return out;
+        }
+
+        // For integer / numerical questions that have no options.
+        function typedAnswerFor(record) {
+            if (!record || record.__error) return '';
+            const keys = ['answer', 'ans', 'correct_answer', 'correct_ans', 'integer_answer', 'numerical_answer', 'numeric_answer'];
+            for (const k of keys) {
+                const v = record[k];
+                if (v !== undefined && v !== null && String(v).trim() !== '') return htmlToText(v) || '';
+            }
+            return '';
+        }
+
+        function optionLayout(options) {
+            const htmls = options.map(function(o) { return extractFragmentHtml(o.option); });
+            let maxLen = 0, rich = false;
+            htmls.forEach(function(h) {
+                const d = new DOMParser().parseFromString(h, 'text/html');
+                if (d.body.querySelector('img, table, svg')) rich = true;
+                const t = (d.body.textContent || '').replace(/\\[a-zA-Z]+|[{}$^_\\]/g, '').trim();
+                maxLen = Math.max(maxLen, t.length);
+            });
+            let cols = 1;
+            if (!rich && options.length > 1) cols = maxLen <= 14 ? 4 : (maxLen <= 44 ? 2 : 1);
+            if (cols === 4 && options.length % 4 !== 0 && options.length < 4) cols = 2;
+            return { cols: cols, htmls: htmls };
+        }
+
+        function optionBodyHtml(html) {
+            const d = new DOMParser().parseFromString(html || '', 'text/html');
+            const empty = !(d.body.textContent || '').trim() && !d.body.querySelector('img, svg, table, .blank');
+            return empty ? '<span class="muted">&mdash;</span>' : html;
         }
 
         function buildPrintHtml(numbered, meta) {
-            let html = '';
-            html += `<div class="pdf-header">
-                <div class="pdf-brand">NY <span>CODER</span></div>
-                <div class="pdf-meta">
-                    Paper ID: ${meta.paperId}<br>
-                    User: ${meta.userId}<br>
-                    Generated: ${meta.date}
-                </div>
-            </div>`;
+            const counts = {};
+            numbered.forEach(function(it) { counts[it.subject] = (counts[it.subject] || 0) + 1; });
+            const countText = Object.keys(counts).map(function(s) { return `${escapeHtml(s)}: ${counts[s]}`; }).join(' &nbsp;|&nbsp; ');
+
+            let html = `<div class="doc-head ui">
+                <div class="brand">NY <span>CODER</span></div>
+                <div class="meta">Paper ID: ${escapeHtml(meta.paperId)}<br>${numbered.length} question${numbered.length === 1 ? '' : 's'} &mdash; ${countText}<br>Generated: ${escapeHtml(meta.date)}</div>
+            </div>
+            <div class="legend ui"><span class="swatch"></span> Correct option is highlighted in green and marked with a tick. Answer key on the last page.</div>`;
 
             let lastSubject = null;
-            numbered.forEach(item => {
+            numbered.forEach(function(item) {
                 if (item.subject !== lastSubject) {
-                    html += `<div class="pdf-subject-title">${item.subject}</div>`;
+                    html += `<div class="subject ui">${escapeHtml(item.subject)}</div>`;
                     lastSubject = item.subject;
                 }
                 const record = item.record;
-                html += `<div class="pdf-question">`;
-                html += `<div><span class="pdf-qnum">Q${item.num}.</span><span class="pdf-qtag">${item.q.toughness || '—'}</span></div>`;
-                html += `<div class="pdf-qtext">${extractFragmentHtml(item.q.q_text) || '(empty)'}</div>`;
+                html += `<section class="q">`;
+                html += `<div class="q-head ui"><span class="q-num">Q${item.num}.</span><span class="q-tag">${escapeHtml(item.q.toughness || '—')}</span></div>`;
+                html += `<div class="q-text">${extractFragmentHtml(item.q.q_text) || '<span class="note">(question text unavailable)</span>'}</div>`;
 
-                const opts = normaliseOptions(record);
-                if (opts.length) {
-                    html += '<div class="pdf-opts">';
-                    opts.forEach((opt, i) => {
-                        html += `<div class="pdf-opt${opt.correct ? ' pdf-correct' : ''}">
-                            <span class="pdf-opt-letter">${optionLetter(i)}.</span>
-                            <span>${extractFragmentHtml(opt.text) || '<em>(option text unavailable)</em>'}</span>
+                if (record && !record.__error && Array.isArray(record.option) && record.option.length) {
+                    const lay = optionLayout(record.option);
+                    html += `<div class="opts cols-${lay.cols} ui">`;
+                    record.option.forEach(function(opt, i) {
+                        const correct = isCorrectOpt(opt);
+                        html += `<div class="opt${correct ? ' correct' : ''}">
+                            <span class="tag">${optionLetter(i)}</span>
+                            <div class="body">${optionBodyHtml(lay.htmls[i])}</div>
+                            ${correct ? TICK_SVG : ''}
                         </div>`;
                     });
                     html += '</div>';
                 } else if (record && record.__error) {
-                    html += `<div class="pdf-opt-unavailable">Options/answer unavailable for QID ${item.q.qid}: ${record.__error}</div>`;
+                    html += `<div class="note ui">Options could not be loaded for this question (QID ${escapeHtml(item.q.qid)}): ${escapeHtml(record.__error)}</div>`;
                 } else {
-                    html += `<div class="pdf-opt-unavailable">No options data available for QID ${item.q.qid}.</div>`;
+                    const typed = typedAnswerFor(record);
+                    if (typed) {
+                        html += `<div class="typed ui"><span class="lbl">Answer</span> ${escapeHtml(typed)}</div>`;
+                    } else {
+                        html += `<div class="note soft ui">No options provided for this question (QID ${escapeHtml(item.q.qid)}).</div>`;
+                    }
                 }
-                html += `</div>`;
+                html += `</section>`;
             });
 
-            html += `<div class="pdf-answer-key"><h2>Answer Key</h2><div class="pdf-key-grid">`;
+            html += `<section class="key ui"><h2>Answer Key</h2>`;
             lastSubject = null;
-            numbered.forEach(item => {
+            let open = false;
+            numbered.forEach(function(item) {
                 if (item.subject !== lastSubject) {
-                    html += `<div class="pdf-key-subject-label">${item.subject}</div>`;
+                    if (open) html += '</div>';
+                    html += `<div class="key-sub">${escapeHtml(item.subject)}</div><div class="key-grid">`;
+                    open = true;
                     lastSubject = item.subject;
                 }
-                const letter = correctLetterFor(item.record);
-                html += `<div class="pdf-key-cell">Q${item.num}: <b>${letter || '—'}</b></div>`;
+                const letters = correctLettersFor(item.record);
+                const typed = letters.length ? '' : typedAnswerFor(item.record);
+                const ans = letters.length ? letters.join(', ') : (typed || '—');
+                const miss = !letters.length && !typed;
+                html += `<div class="key-cell${miss ? ' miss' : ''}">Q${item.num}: <b>${escapeHtml(ans)}</b></div>`;
             });
-            html += `</div></div>`;
-            html += `<div class="pdf-footer">NY CODER :: Question Extraction Terminal — Paper ${meta.paperId} — generated ${meta.date}</div>`;
+            if (open) html += '</div>';
+            html += `</section>`;
             return html;
+        }
+
+        function statusMsg(cls, text) {
+            pdfStatus.classList.remove('hidden');
+            pdfStatus.className = 'status ' + cls;
+            pdfStatus.textContent = text;
         }
 
         async function handleDownloadPdf() {
@@ -1027,128 +1290,112 @@ window.MathJax = {
 
             let groups = [];
             if (currentMode === 'single') {
-                if (!currentSingleQuestion) {
-                    pdfStatus.classList.remove('hidden');
-                    pdfStatus.className = 'status error';
-                    pdfStatus.textContent = 'No question loaded to export yet.';
-                    return;
-                }
+                if (!currentSingleQuestion) { statusMsg('error', 'No question loaded to export yet.'); return; }
                 groups = [{ subject: currentSingleQuestion.subject, questions: [currentSingleQuestion] }];
             } else {
-                if (!lastFullPaperData) {
-                    pdfStatus.classList.remove('hidden');
-                    pdfStatus.className = 'status error';
-                    pdfStatus.textContent = 'No full paper loaded to export yet.';
+                if (!lastFullPaperData) { statusMsg('error', 'No full paper loaded to export yet.'); return; }
+                const subjects = lastFullPaperData.subjects || {};
+                // Refuse to export a silently-truncated paper.
+                const partial = ['Maths', 'Physics', 'Chemistry'].filter(function(s) {
+                    return subjects[s] && subjects[s].error && (subjects[s].questions || []).length > 0;
+                });
+                if (partial.length) {
+                    statusMsg('error', `Paper is incomplete (${partial.join(', ')} failed part-way). Click Execute to reload, then export again.`);
                     return;
                 }
-                const subjects = lastFullPaperData.subjects || {};
                 groups = ['Maths', 'Physics', 'Chemistry']
-                    .map(sub => ({ subject: sub, questions: (subjects[sub] && subjects[sub].questions) || [] }))
-                    .filter(g => g.questions.length > 0);
+                    .map(function(sub) { return { subject: sub, questions: (subjects[sub] && subjects[sub].questions) || [] }; })
+                    .filter(function(g) { return g.questions.length > 0; });
             }
 
             const numbered = [];
             let n = 0;
-            groups.forEach(g => g.questions.forEach(q => { n++; numbered.push({ num: n, subject: g.subject, q }); }));
-
-            if (numbered.length === 0) {
-                pdfStatus.classList.remove('hidden');
-                pdfStatus.className = 'status error';
-                pdfStatus.textContent = 'Nothing to export.';
-                return;
-            }
+            groups.forEach(function(g) { g.questions.forEach(function(q) { n++; numbered.push({ num: n, subject: g.subject, q: q }); }); });
+            if (numbered.length === 0) { statusMsg('error', 'Nothing to export.'); return; }
 
             const originalBtnText = pdfBtn.textContent;
             pdfBtn.disabled = true;
             pdfBtn.textContent = '> Preparing...';
-            pdfStatus.classList.remove('hidden');
-            pdfStatus.className = 'status loading';
-            pdfStatus.textContent = `Compiling ${numbered.length} question(s) into PDF...`;
-
-            let done = 0;
-            await mapWithConcurrency(numbered, 4, async (item) => {
-                item.record = await fetchSolutionRecord(item.q.qid, item.subject);
-                done++;
-                pdfStatus.textContent = `Compiling ${done}/${numbered.length} question(s) into PDF...`;
-            });
-
-            printContainer.innerHTML = buildPrintHtml(numbered, {
-                paperId: paperId, userId: currentUserId(), date: new Date().toLocaleString()
-            });
-
-            pdfStatus.textContent = 'Rendering equations...';
-
-            const finish = () => {
+            const finish = function(cls, msg) {
                 pdfBtn.disabled = false;
                 pdfBtn.textContent = originalBtnText;
-                pdfStatus.classList.add('hidden');
+                printContainer.innerHTML = '';
                 printContainer.style.cssText = '';
+                if (msg) statusMsg(cls, msg); else pdfStatus.classList.add('hidden');
             };
 
-            printContainer.style.cssText = 'display:block; position:fixed; left:-9999px; top:0; width:800px; background:#fff;';
-
-            if (window.MathJax && MathJax.typesetPromise) {
-                try {
-                    await MathJax.typesetPromise([printContainer]);
-                } catch (e) {
-                    console.warn('MathJax typeset error (PDF):', e);
-                }
-            }
-
-            const printCss = Array.from(document.querySelectorAll('style')).map(s => s.outerHTML).join('\\n');
-
-            // Inject MathJax AND base URL directly into the standalone HTML sent to Puppeteer
-            const standaloneHtml = `<!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="utf-8">
-                <base href="https://learning.motion.ac.in/motioneducation/">
-                ${printCss}
-                <style>
-                  body{ background:#fff; padding:0; margin:0; }
-                  .print-only{ display:block !important; }
-                  #printContainer{ position:static !important; left:0 !important; width:auto !important; padding:0; margin:0; }
-                  img{ max-width:100%; height:auto; min-height: 20px; }
-                </style>
-                <script>
-                  window.MathJax = {
-                      tex: { inlineMath: [['$', '$'], ['\\\\(', '\\\\)']] },
-                      chtml: { fontURL: 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/output/chtml/fonts/woff-v2' },
-                      startup: {
-                          pageReady: () => {
-                              return MathJax.startup.defaultPageReady().then(() => {
-                                  window.__mathjaxDone = true;
-                              });
-                          }
-                      }
-                  };
-                </script>
-                <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" id="MathJax-script" async></script>
-            </head>
-            <body>
-                ${printContainer.outerHTML}
-                <script>
-                    setTimeout(function() {
-                        if (!window.__mathjaxDone) window.__mathjaxDone = true;
-                    }, 15000);
-                </script>
-            </body>
-            </html>`;
-
-            pdfStatus.textContent = 'Generating PDF on server...';
-
             try {
+                let done = 0;
+                statusMsg('loading', `Compiling 0/${numbered.length} question(s) into PDF...`);
+                await mapWithConcurrency(numbered, 5, async function(item) {
+                    item.record = await fetchSolutionRecord(item.q.qid, item.subject);
+                    done++;
+                    pdfStatus.textContent = `Compiling ${done}/${numbered.length} question(s) into PDF...`;
+                });
+
+                const failed = numbered.filter(function(it) { return it.record && it.record.__error; });
+                if (failed.length) {
+                    const list = failed.slice(0, 12).map(function(it) { return 'Q' + it.num; }).join(', ') + (failed.length > 12 ? '…' : '');
+                    const go = window.confirm(`Options could not be loaded for ${failed.length} question(s): ${list}.\n\nThe PDF would show a "could not be loaded" note for them.\n\nOK = download anyway, Cancel = stop (then try again).`);
+                    if (!go) { finish('error', `Export cancelled — ${failed.length} question(s) had missing options. Try again.`); return; }
+                }
+
+                statusMsg('loading', 'Rendering equations...');
+                printContainer.innerHTML = buildPrintHtml(numbered, {
+                    paperId: paperId,
+                    date: new Date().toLocaleString()
+                });
+                // Needs layout (off-screen) so MathJax can measure.
+                printContainer.style.cssText = 'display:block; position:fixed; left:-9999px; top:0; width:178mm; background:#fff;';
+
+                if (window.MathJax && MathJax.startup && MathJax.startup.promise) {
+                    try { await MathJax.startup.promise; } catch (e) { console.warn('MathJax startup:', e); }
+                }
+                if (window.MathJax && MathJax.typesetPromise) {
+                    try { await MathJax.typesetPromise([printContainer]); }
+                    catch (e) { console.warn('MathJax typeset error (PDF):', e); }
+                }
+                const mathErrors = printContainer.querySelectorAll('mjx-merror, [data-mjx-error]').length;
+
+                // MathJax adds its per-glyph rules through the CSSOM (insertRule), so they
+                // are NOT in the <style> tag's text. Serialise from sheet.cssRules instead,
+                // otherwise every equation prints blank.
+                const mjxStyles = Array.from(document.querySelectorAll('style'))
+                    .filter(function(s) { return s.id === 'MJX-CHTML-styles' || /mjx-container/.test(s.textContent); })
+                    .map(function(s) {
+                        let css = '';
+                        try { css = Array.from(s.sheet.cssRules).map(function(r) { return r.cssText; }).join('\n'); } catch (e) { css = ''; }
+                        if (!css) css = s.textContent;
+                        return '<style>' + css + '</style>';
+                    })
+                    .join('\n');
+
+                const standaloneHtml = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Source+Serif+4:ital,wght@0,400;0,600;0,700;1,400&display=swap">
+<style>${PRINT_CSS}</style>
+${mjxStyles}
+</head><body>${printContainer.innerHTML}</body></html>`;
+
+                if (new Blob([standaloneHtml]).size > 4300000) {
+                    throw new Error('Paper is too large for a single PDF request (4.3 MB limit). Export subject-by-subject or use Single mode.');
+                }
+
+                statusMsg('loading', 'Generating PDF on server...');
                 const resp = await fetch('/api/pdf', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ html: standaloneHtml, filename: `NY_CODER_Paper_${paperId}` }),
+                    body: JSON.stringify({
+                        html: standaloneHtml,
+                        filename: `NY_CODER_Paper_${paperId}`,
+                        footer: `NY CODER · Paper ${paperId}`
+                    })
                 });
-
                 if (!resp.ok) {
-                    const errJson = await resp.json().catch(() => ({}));
+                    const errJson = await resp.json().catch(function() { return {}; });
                     throw new Error(errJson.error || `HTTP ${resp.status}`);
                 }
-
+                const warnings = resp.headers.get('X-Pdf-Warnings') || '';
                 const blob = await resp.blob();
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
@@ -1157,12 +1404,18 @@ window.MathJax = {
                 document.body.appendChild(a);
                 a.click();
                 a.remove();
-                URL.revokeObjectURL(url);
+                setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
+
+                const notes = [];
+                if (failed.length) notes.push(`${failed.length} question(s) missing options`);
+                if (mathErrors) notes.push(`${mathErrors} equation(s) could not be rendered`);
+                const brokenImgs = /broken-images=(\d+)/.exec(warnings);
+                if (brokenImgs) notes.push(`${brokenImgs[1]} image(s) could not be loaded`);
+                if (notes.length) finish('error', 'PDF downloaded, but: ' + notes.join('; ') + '. Check the marked spots.');
+                else finish();
             } catch (err) {
-                pdfStatus.className = 'status error';
-                pdfStatus.textContent = `PDF generation failed: ${err.message}`;
-            } finally {
-                finish();
+                console.error(err);
+                finish('error', `PDF generation failed: ${err.message}`);
             }
         }
 
@@ -1173,6 +1426,7 @@ window.MathJax = {
             isLoading = true;
             statusDiv.textContent = 'Loading full paper...';
             statusDiv.className = 'status loading';
+
             try {
                 const params = new URLSearchParams({ paper_id: paperId, user_id: currentUserId() });
                 const data = await fetchJSON(`/api/full_paper?${params.toString()}`);
@@ -1193,8 +1447,10 @@ window.MathJax = {
             lastFullPaperData = data;
             const subjects = data.subjects || {};
             let html = '';
+
             let summary = `<div style="background:rgba(0,255,65,0.05);padding:12px 20px;border-radius:8px;margin-bottom:20px;border:1px solid var(--border);">
-                <strong>Paper ID: ${data.paper_id}</strong> &nbsp;|&nbsp;`;
+                <strong>Paper ID: ${data.paper_id}</strong> &nbsp;|&nbsp;
+            `;
             for (const sub of ['Maths', 'Physics', 'Chemistry']) {
                 const info = subjects[sub];
                 const count = info ? info.count : 0;
@@ -1222,6 +1478,9 @@ window.MathJax = {
                         html += `<p style="color:#3a5c3e;padding:10px 0;">No questions found for this subject.</p>`;
                     }
                 } else {
+                    if (info.error) {
+                        html += `<p class="sol-error" style="padding:6px 0;">Warning: ${sub} loaded only partially — ${info.error}. Click Execute to retry.</p>`;
+                    }
                     for (const q of questions) {
                         html += `<div class="question-item">`;
                         html += `<div class="qid">QID: ${q.qid}</div>`;
@@ -1234,7 +1493,9 @@ window.MathJax = {
                 }
                 html += `</div>`;
             }
+
             fullContent.innerHTML = html;
+
             if (window.MathJax && MathJax.typesetPromise) {
                 MathJax.typesetPromise([fullContent]).catch(err => console.warn('MathJax error:', err));
             }
@@ -1254,13 +1515,16 @@ window.MathJax = {
             }
             paperId = newId;
             currentPage = 1;
-            if (currentMode === 'single') fetchQuestion(1);
-            else fetchFullPaper();
+            if (currentMode === 'single') {
+                fetchQuestion(1);
+            } else {
+                fetchFullPaper();
+            }
         }
 
         goBtn.addEventListener('click', resetAndFetch);
         resetBtn.addEventListener('click', function() {
-            paperInput.value = {{ default_paper }};
+            paperInput.value = __DEFAULT_PAPER__;
             resetAndFetch();
         });
         prevBtn.addEventListener('click', function() {
@@ -1283,7 +1547,16 @@ window.MathJax = {
 </html>
 """
 
+
 @app.route("/")
 def index():
     """Serve the main HTML page."""
-    return render_template_string(HTML_TEMPLATE, default_paper=DEFAULT_PAPER_ID, default_user_id=USER_ID)
+    page = (HTML_TEMPLATE
+            .replace("__DEFAULT_PAPER__", str(int(DEFAULT_PAPER_ID)))
+            .replace("__DEFAULT_USER_ID__", html.escape(str(USER_ID), quote=True)))
+    return Response(page, mimetype="text/html")
+
+
+# Note: no app.run() here — Vercel's @vercel/python runtime imports this
+# module and calls the WSGI `app` object directly per-request. Keep this
+# file's top-level `app` name unchanged.
