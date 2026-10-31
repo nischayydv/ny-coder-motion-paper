@@ -36,7 +36,23 @@ vercel dev
 ```
 This runs the same serverless routing locally.
 
+## Configuration (optional environment variables)
+| Variable | Purpose | Default |
+|---|---|---|
+| `NYCODER_USER_ID` | Upstream user id pre-filled in the UI | `833031` |
+| `NYCODER_DEFAULT_PAPER_ID` | Paper id pre-filled in the UI | `46921` |
+
+Set them in Vercel → Project → Settings → Environment Variables.
+
+## PDF export — what it guarantees
+- Correct option(s): green card, filled letter badge, bold text and a tick (readable in B/W too). Multi-correct questions list every correct letter in the answer key; integer-type questions show their answer.
+- Blanks are always visible: `____` runs, empty `<u>`/underlined/bordered spans, `<input>` boxes, `\underline{\hspace{..}}` and empty `\underline{}` all print as a ruled blank.
+- Upstream HTML is sanitised: scripts, `<style>`, classes, ids and event handlers removed; invisible-text styles (white colour, `visibility`, `opacity`) stripped; relative image URLs made absolute.
+- Option fetches retry with back-off and failures are never cached. If options still cannot be loaded you are asked before the PDF is produced, and the PDF marks those questions. A partially-loaded subject blocks export instead of silently shipping an incomplete paper.
+- Images that fail to load print as a visible `[figure could not be loaded]` box and are reported after download.
+- The render page runs with JavaScript disabled and blocks requests to private/loopback/metadata addresses.
+
 ## Notes
-- All three routes (`/`, `/api`, `/api/full_paper`) are served by the single function in `api/index.py`.
-- `DEFAULT_PAPER_ID` and other constants are set at the top of `api/index.py`.
-- Vercel serverless functions have a request timeout (10s on the free Hobby plan). `full_paper_api` fetches three subjects in parallel threads, but if a paper has a lot of pages per subject it can still be slow — consider upgrading the plan or trimming `PLANNER_TEST_ID`/paging logic if you hit timeouts.
+- Function timeouts depend on your plan / Fluid Compute settings; a full 75-question paper typically needs 20-40 s.
+- The PDF request body is limited to ~4.4 MB (Vercel limit); the UI tells you if a paper exceeds it.
+- Consider enabling Vercel's WAF / rate limiting on `/api/pdf` since it launches a headless browser per request.
